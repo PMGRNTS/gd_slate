@@ -1,0 +1,34 @@
+[remap]
+
+importer="font_data_dynamic"
+type="FontFile"
+uid="uid://dpea7t588gwqk"
+path="res://.godot/imported/Ghibli Pro.ttf-a21a036cb60908ab866cbedc9d560a56.fontdata"
+
+[deps]
+
+source_file="res://fonts/fun fonts/Ghibli Pro.ttf"
+dest_files=["res://.godot/imported/Ghibli Pro.ttf-a21a036cb60908ab866cbedc9d560a56.fontdata"]
+
+[params]
+
+Rendering=null
+antialiasing=1
+generate_mipmaps=false
+disable_embedded_bitmaps=true
+multichannel_signed_distance_field=false
+msdf_pixel_range=8
+msdf_size=48
+allow_system_fallback=true
+force_autohinter=false
+hinting=1
+subpixel_positioning=1
+oversampling=0.0
+Fallbacks=null
+fallbacks=[]
+Compress=null
+compress=true
+preload=[]
+language_support={}
+script_support={}
+opentype_features={}
