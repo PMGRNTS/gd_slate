@@ -11,14 +11,10 @@ const API_VERSION = "2023-06-01"
 
 var api_key: String
 
-
 var request_manager: AIRequestManager
 var error_handler: AIErrorHandler
 
 
-
-###################@@@@@@@@@@@@@@@@@@@@@@@@@@@###################
-########### Artifical Intellegence Mode Variables ###############
 var system_prompt_container: PanelContainer
 var system_prompt_editor: TextEdit
 var default_system_prompt = """You are an AI that analyzes and edits Godot 4.x .gd files. The text you receive as prompts is the exact text as the .gd file to be edited. Expect questions and instructions to be embedded inside these scripts as commented out text.
@@ -59,6 +55,9 @@ var is_shift_pressed: bool = false  # To handle Shift+Enter for new lines
 var is_streaming_response: bool = false
 var current_streaming_text: String = ""
 var streaming_timer: Timer
+var is_streaming: bool = false
+var stream_delay: float = 0.03 # 30ms between characters
+var stream_timer: Timer
 var mode_indicator: Label
 var file_info: Label
 var stats_label: Label
@@ -67,7 +66,10 @@ var left_file_name: String = "No file"
 var right_file_name: String = "No file"
 var match_label: Label
 var api_settings: APISettings
-
+var text_animator: JuicyTextAnimator
+var typing_speed: float = 0.002  # Seconds per character
+var current_typing_text: String = ""
+var is_typing: bool = false
 
 # Material Design color palette
 const COLORS = {
@@ -140,12 +142,26 @@ func _ready():
 	main_container.add_theme_constant_override("separation", 16)
 	root_container.add_child(main_container)
 	
-	# Create editors
+	# Create editors WITHOUT syntax highlighting first
 	left_editor = _create_styled_editor()
-	main_container.add_child(left_editor)
+	# Don't add syntax highlighting yet
 	
 	right_editor = _create_styled_editor()
+	# Don't add syntax highlighting yet
+	
+	# Add them to your container
+	main_container.add_child(left_editor)
 	main_container.add_child(right_editor)
+	
+	# Test with some text to see if it's white
+	left_editor.text = "# This should be white text\nfunc test():\n\tvar x = 42\n\tprint(x)"
+	right_editor.text = "# This should also be white\nfunc another_test():\n\tvar y = \"hello\"\n\tprint(y)"
+	
+	# Wait a moment, then apply syntax highlighting
+	call_deferred("_test_syntax_highlighting")
+	
+	text_animator = JuicyTextAnimator.new(left_editor)
+	add_child(text_animator)
 	
 	# Now that our basic structure is in place, we can set up the rest
 	_setup_editor_features()
@@ -179,9 +195,6 @@ func _ready():
 	# Create the status bar LAST, after everything else is set up
 	call_deferred("_create_status_bar")
 	call_deferred("_refresh_syntax_highlighting")
-	
-	
-	
 
 
 
@@ -263,10 +276,10 @@ func _setup_input_shortcuts():
 
 func _unhandled_input(event):
 	if event.is_action_pressed("toggle_search"):
-		print("Search shortcut detected")  # Debug print
+		print("Search shortcut detected")
 		_toggle_search()
 		get_viewport().set_input_as_handled()
-	elif search_container.visible:
+	elif search_container and search_container.visible:
 		if event is InputEventKey and event.pressed:
 			match event.keycode:
 				KEY_ESCAPE:
@@ -278,31 +291,112 @@ func _unhandled_input(event):
 					else:
 						_find_next()
 					get_viewport().set_input_as_handled()
-			# Add system prompt toggle to existing input handling
+	
+	# System prompt toggle
 	if event.is_action_pressed("toggle_system_prompt"):
 		_toggle_system_prompt()
 		get_viewport().set_input_as_handled()
-	# Add API settings shortcut
-	if event is InputEventKey:
-		if event.pressed and event.keycode == KEY_R and event.ctrl_pressed:
-			api_settings.popup_centered()
+	
+	# API settings shortcut
+	if event is InputEventKey and event.pressed and event.keycode == KEY_R and event.ctrl_pressed:
+		api_settings.popup_centered()
+		get_viewport().set_input_as_handled()
+	
+	# DIRECT KEYBOARD HANDLING - no InputMap needed
+	if event is InputEventKey and event.pressed:
+		# Clear editors (Ctrl+Shift+N)
+		if event.keycode == KEY_N and event.ctrl_pressed and event.shift_pressed:
+			_clear_both_editors()
+			get_viewport().set_input_as_handled()
+		
+		# Quick save (Ctrl+S)
+		elif event.keycode == KEY_S and event.ctrl_pressed:
+			_quick_save_active_editor()
+			get_viewport().set_input_as_handled()
+		
+		# Toggle word wrap (Ctrl+W)
+		elif event.keycode == KEY_W and event.ctrl_pressed:
+			_toggle_word_wrap()
+			get_viewport().set_input_as_handled()
+		
+		# Open file in active editor (Ctrl+O)
+		elif event.keycode == KEY_O and event.ctrl_pressed:
+			if active_editor:
+				_open_file(active_editor)
+			get_viewport().set_input_as_handled()
+		
+		# Toggle AI mode (Ctrl+Shift+A)
+		elif event.keycode == KEY_A and event.ctrl_pressed and event.shift_pressed:
+			toggle_ai_mode()
 			get_viewport().set_input_as_handled()
 	
-	# Handle keyboard scrolling (Up/Down/PageUp/PageDown)
+	# Handle sync scrolling
 	if sync_scroll_enabled and active_editor:
 		var target_editor = right_editor if active_editor == left_editor else left_editor
-		var scroll_handled = false
 		
 		if event.is_action_pressed("ui_up") or event.is_action_pressed("ui_down") or \
 		   event.is_action_pressed("ui_page_up") or event.is_action_pressed("ui_page_down"):
-			# Wait one frame to let the active editor process the scroll
 			await get_tree().process_frame
-			# Sync the scroll position
 			target_editor.set_v_scroll(active_editor.get_v_scroll())
-			scroll_handled = true
-		
-		if scroll_handled:
 			get_viewport().set_input_as_handled()
+
+
+func _clear_both_editors():
+	left_editor.text = ""
+	right_editor.text = ""
+	left_file_name = "No file"
+	right_file_name = "No file"
+	_update_status_info()
+
+func _quick_save_active_editor():
+	if not active_editor:
+		print("No active editor to save")
+		return
+		
+	var file_dialog = FileDialog.new()
+	file_dialog.file_mode = FileDialog.FILE_MODE_SAVE_FILE
+	file_dialog.access = FileDialog.ACCESS_FILESYSTEM
+	file_dialog.title = "Save File"
+	file_dialog.add_filter("*.gd ; GDScript files")
+	file_dialog.add_filter("*.txt ; Text files")
+	file_dialog.add_filter("* ; All files")
+	
+	add_child(file_dialog)
+	file_dialog.popup_centered(Vector2(600, 400))
+	
+	file_dialog.file_selected.connect(
+		func(path):
+			var file = FileAccess.open(path, FileAccess.WRITE)
+			if file:
+				file.store_string(active_editor.text)
+				print("Saved file: ", path)
+				# Update filename
+				if active_editor == left_editor:
+					left_file_name = path.get_file()
+				else:
+					right_file_name = path.get_file()
+				_update_status_info()
+			file_dialog.queue_free()
+	)
+
+func _toggle_word_wrap():
+	if not view_menu_button or not is_instance_valid(view_menu_button):
+		print("View menu button not available")
+		return
+		
+	var popup = view_menu_button.get_popup()
+	var current_wrap = popup.is_item_checked(1)
+	popup.set_item_checked(1, !current_wrap)
+	
+	# Apply word wrap to both editors
+	var wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY if !current_wrap else TextEdit.LINE_WRAPPING_NONE
+	if left_editor:
+		left_editor.wrap_mode = wrap_mode
+	if right_editor:
+		right_editor.wrap_mode = wrap_mode
+	
+	print("Word wrap toggled: ", !current_wrap)
+	
 
 
 
@@ -476,7 +570,7 @@ func _style_popup_menu(popup: PopupMenu):
 	popup.add_theme_stylebox_override("panel", popup_style)
 
 
-
+##Creates File drop down
 func _create_menu_container() -> PanelContainer:
 	var menu_container = PanelContainer.new()
 	
@@ -519,202 +613,46 @@ func _create_menu_container() -> PanelContainer:
 
 
 
-func _create_styled_editor() -> CodeEdit:
-	var editor = CodeEdit.new()
-	editor.set_h_size_flags(Control.SIZE_EXPAND_FILL)
-	editor.set_v_size_flags(Control.SIZE_EXPAND_FILL)
+func _setup_enhanced_shortcuts():
+	# Add more useful keyboard shortcuts for power users
 	
-	# Apply Material Design styling to the editor
-	var editor_style = StyleBoxFlat.new()
-	editor_style.bg_color = COLORS.code_background
-	editor_style.corner_radius_top_left = 4
-	editor_style.corner_radius_top_right = 4
-	editor_style.corner_radius_bottom_left = 4
-	editor_style.corner_radius_bottom_right = 4
-	editor_style.shadow_color = COLORS.elevation_1
-	editor_style.shadow_size = 2
-	editor_style.content_margin_left = 8
-	editor_style.content_margin_right = 8
-	editor_style.content_margin_top = 8
-	editor_style.content_margin_bottom = 8
+	# Clear editors shortcut (Ctrl+Shift+N)
+	if not InputMap.has_action("clear_editors"):
+		InputMap.add_action("clear_editors")
+		var clear_event = InputEventKey.new()
+		clear_event.keycode = KEY_N
+		clear_event.ctrl_pressed = true
+		clear_event.shift_pressed = true
+		InputMap.action_add_event("clear_editors", clear_event)
 	
-	editor.add_theme_stylebox_override("normal", editor_style)
-	editor.add_theme_color_override("font_color", COLORS.code_text)
+	# Quick save shortcut (Ctrl+S)
+	if not InputMap.has_action("quick_save"):
+		InputMap.add_action("quick_save")
+		var save_event = InputEventKey.new()
+		save_event.keycode = KEY_S
+		save_event.ctrl_pressed = true
+		InputMap.action_add_event("quick_save", save_event)
 	
-	# Basic editor settings
-	editor.gutters_draw_line_numbers = true
-	editor.minimap_draw = false
-	editor.draw_tabs = true
-	editor.draw_spaces = false
-	editor.highlight_current_line = true
-	editor.add_theme_constant_override("line_spacing", 6)
-	
-	# Create and configure a new syntax highlighter
-	var highlighter = CodeHighlighter.new()
-	_configure_syntax_highlighting(highlighter)  # Apply our custom syntax highlighting
-	editor.syntax_highlighter = highlighter
-	
-	print("Updated editor colors. Current font color: ", 
-				  editor.get_theme_color("font_color", "CodeEdit"))
-	
-	return editor
+	# Toggle word wrap (Ctrl+W)
+	if not InputMap.has_action("toggle_word_wrap"):
+		InputMap.add_action("toggle_word_wrap")
+		var wrap_event = InputEventKey.new()
+		wrap_event.keycode = KEY_W
+		wrap_event.ctrl_pressed = true
+		InputMap.action_add_event("toggle_word_wrap", wrap_event)
 
 
 
-func _refresh_syntax_highlighting() -> void:
-	var is_dark = view_menu_button.get_popup().is_item_checked(2)  # Check if dark theme is enabled
-	
-	# Create and configure new highlighters for both editors
-	var left_highlighter = CodeHighlighter.new()
-	var right_highlighter = CodeHighlighter.new()
-	
-	# Configure both highlighters with the current theme
-	_configure_syntax_highlighting(left_highlighter, is_dark)
-	_configure_syntax_highlighting(right_highlighter, is_dark)
-	
-	# Apply the highlighters to the editors
-	left_editor.syntax_highlighter = left_highlighter
-	right_editor.syntax_highlighter = right_highlighter
 
 
 
-func _configure_syntax_highlighting(highlighter: CodeHighlighter, is_dark: bool = true):
-	# Define color schemes for both dark and light themes
-	const DARK_COLORS = {
-		"SYMBOL": Color("#abc9ff"),      # Light blue for symbols/operators
-		"KEYWORD": Color("#ff7085"),     # Pink for keywords
-		"CONTROL": Color("#ff8ccc"),     # Light pink for control flow
-		"BASE_TYPE": Color("#42ffc2"),   # Bright green for base types
-		"ENGINE_TYPE": Color("#8fffdb"), # Lighter green for engine types
-		"USER_TYPE": Color("#c7ffed"),   # Pale green for user types
-		"COMMENT": Color("#676767"),     # Gray for comments
-		"DOC_COMMENT": Color("#99b3cc"), # Blue-gray for doc comments
-		"STRING": Color("#ffeda1"),      # Light yellow for strings
-		"TEXT": Color("#ffffff"),        # White for regular text
-		# Adding official Godot colors
-		"FUNCTION_DEF": Color("#66e6ff"), # Function definitions
-		"FUNCTION": Color("#57b3ff"),     # Functions
-		"GLOBAL_FUNC": Color("#a3a3f5"),  # Global functions
-		"NODE_REF": Color("#63c259"),     # Node references
-		"MEMBER_VAR": Color("#bce0ff")    # Member variables
-	}
-	
-	const LIGHT_COLORS = {
-		"SYMBOL": Color("#f000ff"),      # Blue for symbols/operators
-		"KEYWORD": Color("#ff0000"),     # Red for keywords
-		"CONTROL": Color("#cc0000"),     # Dark red for control flow
-		"BASE_TYPE": Color("#009900"),   # Dark green for base types
-		"ENGINE_TYPE": Color("#006600"), # Darker green for engine types
-		"USER_TYPE": Color("#003300"),   # Very dark green for user types
-		"COMMENT": Color("#999999"),     # Gray for comments
-		"DOC_COMMENT": Color("#666699"), # Blue-gray for doc comments
-		"STRING": Color("#990099"),      # Purple for strings
-		"TEXT": Color("#000000"),        # Black for regular text
-		# Adding official Godot colors (same as dark theme since these are standard)
-		"FUNCTION_DEF": Color("#66e6ff"), # Function definitions
-		"FUNCTION": Color("#57b3ff"),     # Functions
-		"GLOBAL_FUNC": Color("#a3a3f5"),  # Global functions
-		"NODE_REF": Color("#63c259"),     # Node references
-		"MEMBER_VAR": Color("#bce0ff")    # Member variables
-	}
-	
-	# Choose the appropriate color scheme
-	var COLORS = DARK_COLORS if is_dark else LIGHT_COLORS
-	
-	# String literals
-	highlighter.add_color_region("\"", "\"", COLORS.STRING, false)
-	highlighter.add_color_region("'", "'", COLORS.STRING, false)
-	
-	# Comments
-	highlighter.add_color_region("#", "", COLORS.COMMENT, true)
-	highlighter.add_color_region("##", "", COLORS.DOC_COMMENT, true)
-	highlighter.add_color_region("\"\"\"", "\"\"\"", COLORS.COMMENT, true)
-	
-	# Function definitions
-	highlighter.add_keyword_color("(?<=func\\s)\\w+(?=\\s*\\()", COLORS.FUNCTION_DEF)
-	
-	# Function calls
-	highlighter.add_keyword_color("\\w+(?=\\s*\\()", COLORS.FUNCTION)
-	
-	# Global functions (starting with underscore)
-	highlighter.add_keyword_color("_\\w+(?=\\s*\\()", COLORS.GLOBAL_FUNC)
-	
-	# Node references (paths)
-	highlighter.add_keyword_color("\\$[\\w/]+", COLORS.NODE_REF)
-	
-	# Member variables
-	highlighter.add_keyword_color("(?<=\\.)\\w+\\b(?!\\()", COLORS.MEMBER_VAR)
-	
-	# Keywords dictionary
-	var keywords = {
-		# Control flow keywords
-		"if": COLORS.CONTROL,
-		"elif": COLORS.CONTROL,
-		"else": COLORS.CONTROL,
-		"for": COLORS.CONTROL,
-		"while": COLORS.CONTROL,
-		"break": COLORS.CONTROL,
-		"continue": COLORS.CONTROL,
-		"pass": COLORS.CONTROL,
-		"return": COLORS.CONTROL,
-		"match": COLORS.CONTROL,
-		
-		# Declaration keywords
-		"func": COLORS.KEYWORD,
-		"class": COLORS.KEYWORD,
-		"class_name": COLORS.KEYWORD,
-		"extends": COLORS.KEYWORD,
-		"static": COLORS.KEYWORD,
-		
-		# Variable keywords
-		"var": COLORS.KEYWORD,
-		"const": COLORS.KEYWORD,
-		"signal": COLORS.KEYWORD,
-		"export": COLORS.KEYWORD,
-		
-		# Built-in types
-		"bool": COLORS.BASE_TYPE,
-		"int": COLORS.BASE_TYPE,
-		"float": COLORS.BASE_TYPE,
-		"String": COLORS.BASE_TYPE,
-		"Array": COLORS.BASE_TYPE,
-		"Dictionary": COLORS.BASE_TYPE,
-		
-		# Engine types
-		"Vector2": COLORS.ENGINE_TYPE,
-		"Vector3": COLORS.ENGINE_TYPE,
-		"Transform2D": COLORS.ENGINE_TYPE,
-		"Transform3D": COLORS.ENGINE_TYPE,
-		"Color": COLORS.ENGINE_TYPE,
-		"NodePath": COLORS.ENGINE_TYPE,
-		"Node": COLORS.ENGINE_TYPE,
-		"Control": COLORS.ENGINE_TYPE,
-		
-		# Special keywords
-		"self": COLORS.KEYWORD,
-		"super": COLORS.KEYWORD
-	}
-	
-	# Apply all keyword colors
-	for keyword in keywords:
-		highlighter.add_keyword_color(keyword, keywords[keyword])
-	
-	# Numbers
-	highlighter.add_keyword_color("\\b\\d+\\b", COLORS.BASE_TYPE)
-	highlighter.add_keyword_color("\\b\\d+\\.\\d+\\b", COLORS.BASE_TYPE)
-	
-	# Symbols and operators
-	var symbols = [
-		"+", "-", "*", "/", "=", 
-		"<", ">", "!", ",", 
-		";", ":", "(", ")", "[", 
-		"]", "{", "}", "$", "@"
-	]
-	
-	for symbol in symbols:
-		highlighter.add_keyword_color(symbol, COLORS.SYMBOL)
 
 
+
+
+
+###########################
+##TITLE BAR FUNCTIONALITY##
 func _on_title_bar_gui_input(event):
 	if event is InputEventMouseButton:
 		if event.button_index == MOUSE_BUTTON_LEFT:
@@ -747,30 +685,84 @@ func _open_file(editor: CodeEdit):
 	file_dialog.access = FileDialog.ACCESS_FILESYSTEM
 	file_dialog.title = "Select a File"
 	
-	# Add file filters for different file types
+	# Enhanced file filters for better developer experience
 	file_dialog.add_filter("*.gd ; GDScript files")
-	file_dialog.add_filter("*.cs ; C# files")
+	file_dialog.add_filter("*.cs ; C# files") 
+	file_dialog.add_filter("*.js ; JavaScript files")
+	file_dialog.add_filter("*.ts ; TypeScript files")
+	file_dialog.add_filter("*.py ; Python files")
+	file_dialog.add_filter("*.cpp,*.hpp,*.c,*.h ; C/C++ files")
 	file_dialog.add_filter("*.txt ; Text files")
+	file_dialog.add_filter("*.md ; Markdown files")
+	file_dialog.add_filter("*.json ; JSON files")
+	file_dialog.add_filter("*.xml ; XML files")
 	file_dialog.add_filter("* ; All files")
 	
 	add_child(file_dialog)
-	file_dialog.popup_centered(Vector2(600, 320))
+	file_dialog.popup_centered(Vector2(800, 600))  # Larger dialog for better UX
 	
-	# Connect the file selection signal with updated callback
+	# Enhanced file handling with proper error checking
 	file_dialog.file_selected.connect(
 		func(path):
-			var file = FileAccess.open(path, FileAccess.READ)
-			if file:
-				editor.text = file.get_as_text()
-				# Update the appropriate file name
-				if editor == left_editor:
-					left_file_name = path.get_file()
-				else:
-					right_file_name = path.get_file()
-				# Update the status bar
-				_update_status_info()
+			_load_file_safely(path, editor)
 			file_dialog.queue_free()
 	)
+
+
+
+func _load_file_safely(file_path: String, editor: CodeEdit):
+	# Enhanced file loading with comprehensive error handling
+	if not FileAccess.file_exists(file_path):
+		_show_error_message("File not found: " + file_path)
+		return
+		
+	var file = FileAccess.open(file_path, FileAccess.READ)
+	if not file:
+		_show_error_message("Cannot open file: " + file_path + "\nCheck file permissions.")
+		return
+		
+	var file_content = file.get_as_text()
+	var error = file.get_error()
+	
+	if error != OK:
+		_show_error_message("Error reading file: " + file_path + "\nError code: " + str(error))
+		return
+		
+	# Successfully loaded file
+	editor.text = file_content
+	
+	# Update the appropriate file name
+	var file_name = file_path.get_file()
+	if editor == left_editor:
+		left_file_name = file_name
+	else:
+		right_file_name = file_name
+	
+	# Refresh syntax highlighting for the new content
+	call_deferred("_refresh_syntax_highlighting")
+	
+	# Update the status bar
+	_update_status_info()
+	
+	print("Successfully loaded file: ", file_name, " (", file_content.length(), " characters)")
+
+
+
+func _show_error_message(message: String):
+	# Helper function to show error messages to the user
+	var dialog = AcceptDialog.new()
+	dialog.title = "Error"
+	
+	var label = Label.new()
+	label.text = message
+	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	dialog.add_child(label)
+	
+	add_child(dialog)
+	dialog.popup_centered()
+	
+	# Auto-cleanup after user closes the dialog
+	dialog.confirmed.connect(func(): dialog.queue_free())
 
 
 
@@ -840,9 +832,53 @@ func _on_ai_mode_pressed(id: int):
 
 
 
+func _on_view_menu_pressed(id: int):
+	# Now we can safely access the popup through our stored menu button
+	var popup = view_menu_button.get_popup()
+	
+	match id:
+		0:  # Show Line Numbers
+			var show_lines = !popup.is_item_checked(0)
+			popup.set_item_checked(0, show_lines)
+			left_editor.gutters_draw_line_numbers = show_lines
+			right_editor.gutters_draw_line_numbers = show_lines
+			
+		1:  # Word Wrap
+			var wrap_enabled = !popup.is_item_checked(1)
+			popup.set_item_checked(1, wrap_enabled)
+			left_editor.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY if wrap_enabled else TextEdit.LINE_WRAPPING_NONE
+			right_editor.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY if wrap_enabled else TextEdit.LINE_WRAPPING_NONE
+			
+		2:  # Dark Theme
+			var dark_theme = !popup.is_item_checked(2)
+			popup.set_item_checked(2, dark_theme)
+			_apply_theme(dark_theme)
+			
+		3:  # Sync Scrolling
+			sync_scroll_enabled = !popup.is_item_checked(3)
+			popup.set_item_checked(3, sync_scroll_enabled)
+			if sync_scroll_enabled:
+				_connect_editor_signals()
+			else:
+				_disconnect_editor_signals()
+
+
+
+
+
+
+###########
+##AI MODE##
 func toggle_ai_mode():
+	_cleanup_resources()  # Add this line at the start
+	
 	ai_mode_active = !ai_mode_active
 	current_mode = EditorMode.AI if ai_mode_active else EditorMode.COMPARE
+	
+	
+	# Reset typing state when toggling modes
+	is_typing = false
+	current_typing_text = ""
 	
 	# Create a tween for smooth transitions
 	var tween = create_tween()
@@ -861,7 +897,6 @@ func toggle_ai_mode():
 	
 	# Update the AI mode button appearance
 	if is_instance_valid(ai_mode_button):
-		# Visual feedback for active state
 		ai_mode_button.add_theme_color_override(
 			"font_color",
 			COLORS.ai_mode_accent if ai_mode_active else COLORS.on_surface
@@ -894,6 +929,9 @@ func _configure_editors_for_ai_mode():
 	
 	# Disconnect scroll sync in AI mode
 	_disconnect_editor_signals()
+	
+	is_typing = false
+	current_typing_text = ""
 
 
 
@@ -922,6 +960,8 @@ func _configure_editors_for_compare_mode():
 	# Reconnect scroll sync if it was enabled
 	if sync_scroll_enabled:
 		_connect_editor_signals()
+	is_typing = false
+	current_typing_text = ""
 
 
 
@@ -1013,54 +1053,6 @@ func _transition_to_ai_mode(tween: Tween):
 
 
 
-func _get_all_menu_buttons() -> Array:
-	var menu_buttons = []
-	
-	# Get the menu container first
-	var menu_container = _get_menu_container()
-	if not menu_container:
-		push_warning("Menu container not found when searching for menu buttons")
-		return menu_buttons
-	
-	# Search through all children recursively to find MenuButtons
-	# This is more reliable than assuming a specific hierarchy
-	_find_menu_buttons_recursive(menu_container, menu_buttons)
-	
-	return menu_buttons
-
-
-
-# Helper function to recursively search for MenuButtons
-func _find_menu_buttons_recursive(node: Node, buttons: Array) -> void:
-	# Check if this node is a MenuButton
-	if node is MenuButton:
-		buttons.append(node)
-	
-	# Recursively check all children
-	for child in node.get_children():
-		_find_menu_buttons_recursive(child, buttons)
-
-# Helper function to get the menu container
-func _get_menu_container() -> PanelContainer:
-	# Safety check for root_container
-	if not root_container:
-		push_warning("root_container is null")
-		return null
-	
-	# Make sure we have children
-	if root_container.get_child_count() == 0:
-		push_warning("root_container has no children")
-		return null
-	
-	# Get the first child, which should be our menu container
-	var first_child = root_container.get_child(0)
-	if first_child is PanelContainer:
-		return first_child
-	
-	push_warning("First child is not a PanelContainer as expected")
-	return null
-
-
 
 func _transition_to_normal_mode(tween: Tween):
 	# Transition background color of editors back to normal
@@ -1150,53 +1142,53 @@ func _transition_to_normal_mode(tween: Tween):
 
 
 
-func _on_view_menu_pressed(id: int):
-	# Now we can safely access the popup through our stored menu button
-	var popup = view_menu_button.get_popup()
+func _get_all_menu_buttons() -> Array:
+	var menu_buttons = []
 	
-	match id:
-		0:  # Show Line Numbers
-			var show_lines = !popup.is_item_checked(0)
-			popup.set_item_checked(0, show_lines)
-			left_editor.gutters_draw_line_numbers = show_lines
-			right_editor.gutters_draw_line_numbers = show_lines
-			
-		1:  # Word Wrap
-			var wrap_enabled = !popup.is_item_checked(1)
-			popup.set_item_checked(1, wrap_enabled)
-			left_editor.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY if wrap_enabled else TextEdit.LINE_WRAPPING_NONE
-			right_editor.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY if wrap_enabled else TextEdit.LINE_WRAPPING_NONE
-			
-		2:  # Dark Theme
-			var dark_theme = !popup.is_item_checked(2)
-			popup.set_item_checked(2, dark_theme)
-			_apply_theme(dark_theme)
-			
-		3:  # Sync Scrolling
-			sync_scroll_enabled = !popup.is_item_checked(3)
-			popup.set_item_checked(3, sync_scroll_enabled)
-			if sync_scroll_enabled:
-				_connect_editor_signals()
-			else:
-				_disconnect_editor_signals()
+	# Get the menu container first
+	var menu_container = _get_menu_container()
+	if not menu_container:
+		push_warning("Menu container not found when searching for menu buttons")
+		return menu_buttons
+	
+	# Search through all children recursively to find MenuButtons
+	# This is more reliable than assuming a specific hierarchy
+	_find_menu_buttons_recursive(menu_container, menu_buttons)
+	
+	return menu_buttons
 
 
 
-func _setup_scroll_sync():
-	# Instead of using vertical_scroll_changed, we'll monitor the scrolling directly
-	if not left_editor.gui_input.is_connected(_handle_editor_scroll):
-		left_editor.gui_input.connect(_handle_editor_scroll.bind(left_editor))
-	if not right_editor.gui_input.is_connected(_handle_editor_scroll):
-		right_editor.gui_input.connect(_handle_editor_scroll.bind(right_editor))
+func _find_menu_buttons_recursive(node: Node, buttons: Array) -> void:
+	# Check if this node is a MenuButton
+	if node is MenuButton:
+		buttons.append(node)
+	
+	# Recursively check all children
+	for child in node.get_children():
+		_find_menu_buttons_recursive(child, buttons)
 
 
 
-func _disconnect_scroll_sync():
-	# Disconnect the gui_input signals
-	if left_editor.gui_input.is_connected(_handle_editor_scroll):
-		left_editor.gui_input.disconnect(_handle_editor_scroll)
-	if right_editor.gui_input.is_connected(_handle_editor_scroll):
-		right_editor.gui_input.disconnect(_handle_editor_scroll)
+func _get_menu_container() -> PanelContainer:
+	# Safety check for root_container
+	if not root_container:
+		push_warning("root_container is null")
+		return null
+	
+	# Make sure we have children
+	if root_container.get_child_count() == 0:
+		push_warning("root_container has no children")
+		return null
+	
+	# Get the first child, which should be our menu container
+	var first_child = root_container.get_child(0)
+	if first_child is PanelContainer:
+		return first_child
+	
+	push_warning("First child is not a PanelContainer as expected")
+	return null
+
 
 
 
@@ -1220,15 +1212,19 @@ func _handle_editor_scroll(event: InputEvent, source_editor: CodeEdit):
 
 
 
-func _sync_scroll(source_editor: CodeEdit):
-	if not sync_scroll_enabled:
-		return
-		
-	var target_editor = right_editor if source_editor == left_editor else left_editor
-	target_editor.vertical_scroll = source_editor.vertical_scroll
 
 
 
+
+
+
+
+
+
+
+
+########################
+##SEARCH FUNCTIONALITY##
 func _setup_search_bar():
 	# Create a container that will sit between the editors
 	search_container = PanelContainer.new()
@@ -1457,6 +1453,88 @@ func _highlight_current_result():
 
 
 
+func _on_search_submitted(_text: String):
+	_find_next()
+
+
+
+func _highlight_all_matches():
+	var search_text = search_bar.text
+	if search_text.is_empty():
+		return
+	
+	for position in search_results:
+		_highlight_match(position, search_text.length(), false)
+
+
+
+func _highlight_match(position: int, length: int, is_current: bool = false):
+	var text = active_editor.text
+	var line = 0
+	var current_pos = 0
+	
+	# Find the line number
+	while current_pos < position:
+		var newline_pos = text.find("\n", current_pos)
+		if newline_pos == -1 or newline_pos >= position:
+			break
+		line += 1
+		current_pos = newline_pos + 1
+	
+	# Calculate column start and end
+	var column_start = position - current_pos
+	var column_end = column_start + length
+	
+	# For the current match, we use select() to highlight it
+	# CodeEdit only supports one selection at a time
+	if is_current:
+		active_editor.select(line, column_start, line, column_end)
+		
+		# Also set the caret position to make it visible
+		active_editor.set_caret_line(line)
+		active_editor.set_caret_column(column_end)
+	
+	# For non-current matches, we unfortunately cannot highlight them
+	# as CodeEdit doesn't support multiple selections or custom text highlighting
+	# We could potentially implement this using syntax highlighting or custom drawing
+	# but that would be more complex and require additional setup
+
+
+
+func _clear_search_highlights():
+	if active_editor:
+		# Simply selecting an empty range effectively clears the selection
+		active_editor.select(0, 0, 0, 0)
+
+
+
+func _update_match_count():
+	if match_label:  # Check if the label exists
+		if search_results.is_empty():
+			match_label.text = "No matches"
+		else:
+			match_label.text = "%d/%d matches" % [current_search_index + 1, search_results.size()]
+
+
+
+func _update_selection_colors():
+	# Set selection colors
+	active_editor.add_theme_color_override("selection_color", Color(0.4, 0.6, 0.8, 0.3))  # Light blue
+	active_editor.add_theme_color_override("font_selected_color", COLORS.code_text)
+
+
+
+
+
+
+
+
+
+
+
+
+###############################
+##AI SETUP AND SYSTEM PROMPT ##
 func _setup_system_prompt_shortcut():
 	# Remove any existing shortcuts to prevent duplicates
 	if InputMap.has_action("toggle_system_prompt"):
@@ -1615,109 +1693,6 @@ func _save_system_prompt():
 
 
 
-func _apply_theme(dark_theme: bool):
-	var editor_style = StyleBoxFlat.new()
-	
-	if dark_theme:
-		editor_style.bg_color = COLORS.code_background
-		# Refresh syntax highlighting with dark theme colors
-		_refresh_syntax_highlighting()
-	else:
-		editor_style.bg_color = Color("ffffff")
-		# Refresh syntax highlighting with light theme colors
-		_refresh_syntax_highlighting()
-	
-	# Apply the style to both editors
-	editor_style.corner_radius_top_left = 4
-	editor_style.corner_radius_top_right = 4
-	editor_style.corner_radius_bottom_left = 4
-	editor_style.corner_radius_bottom_right = 4
-	
-	left_editor.add_theme_stylebox_override("normal", editor_style.duplicate())
-	right_editor.add_theme_stylebox_override("normal", editor_style.duplicate())
-
-
-
-func _update_editor_labels(left_label: String, right_label: String):
-	# We'll create labels if they don't exist, update them if they do
-	var left_header = left_editor.get_node_or_null("Header")
-	var right_header = right_editor.get_node_or_null("Header")
-	
-	if not left_header:
-		left_header = Label.new()
-		left_header.name = "Header"
-		left_header.add_theme_font_size_override("font_size", 14)
-		left_editor.add_child(left_header)
-		left_header.position = Vector2(10, -25)
-	
-	if not right_header:
-		right_header = Label.new()
-		right_header.name = "Header"
-		right_header.add_theme_font_size_override("font_size", 14)
-		right_editor.add_child(right_header)
-		right_header.position = Vector2(10, -25)
-	
-	left_header.text = left_label
-	right_header.text = right_label
-
-
-
-func _debug_search_visibility():
-	print("Debug Search Visibility:")
-	print("Search container visible: ", search_container.visible)
-	print("Search container global position: ", search_container.global_position)
-	print("Search container size: ", search_container.size)
-	print("Search bar global position: ", search_bar.global_position)
-	print("Canvas layer exists: ", is_instance_valid(search_container.get_parent()))
-	print("Canvas layer layer number: ", search_container.get_parent().layer)
-
-
-
-func _create_processing_indicator():
-	var indicator = HBoxContainer.new()
-	indicator.name = "ProcessingIndicator"
-	indicator.position = Vector2(10, 10)
-	
-	var spinner = TextureRect.new()  # You'll need to add a spinner texture
-	var label = Label.new()
-	label.text = "Processing..."
-	label.add_theme_color_override("font_color", COLORS.ai_mode_accent)
-	
-	indicator.add_child(spinner)
-	indicator.add_child(label)
-	left_editor.add_child(indicator)
-	indicator.hide()
-
-
-
-func _handle_ai_response(response: String):
-	# Update the output editor with the response
-	left_editor.text = response
-	
-	# Hide processing indicator
-	var indicator = left_editor.get_node_or_null("ProcessingIndicator")
-	if indicator:
-		indicator.hide()
-	
-	is_processing_ai = false
-
-
-
-func _remove_processing_indicator():
-	var indicator = left_editor.get_node_or_null("ProcessingIndicator")
-	if indicator:
-		indicator.queue_free()
-	is_processing_ai = false
-
-
-
-func _on_input_text_changed():
-	if current_mode == EditorMode.AI:
-		# Here we might want to implement a debounce mechanism
-		# to avoid too frequent API calls
-		_process_ai_request()
-
-
 
 func _load_api_key() -> void:
 	## In a real application, you'd want to use secure storage
@@ -1734,6 +1709,8 @@ func _load_api_key() -> void:
 	#var file = FileAccess.open("user://api_config.save", FileAccess.WRITE)
 	#file.store_line(api_key)
 
+
+
 func _on_api_key_saved(new_key: String) -> void:
 	api_key = new_key
 	request_manager.set_api_key(new_key)  # Update request manager's API key
@@ -1748,6 +1725,21 @@ func _on_api_key_saved(new_key: String) -> void:
 		# Retry the request
 		_process_ai_request()
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+#############################
+##AI RESPONSE FUNCTIONALITY##
 func _process_ai_request() -> void:
 	if is_processing_ai:
 		return
@@ -1817,67 +1809,63 @@ func _handle_api_error(error_message: String) -> void:
 
 
 
-#func _show_api_key_dialog() -> void:
-	#var dialog = AcceptDialog.new()
-	#dialog.title = "API Key Required"
-	#
-	## Create a VBox for dialog content
-	#var vbox = VBoxContainer.new()
-	#vbox.add_theme_constant_override("separation", 10)
-	#
-	## Add explanation label
-	#var label = Label.new()
-	#label.text = "Please enter your Anthropic API key:"
-	#vbox.add_child(label)
-	#
-	## Add API key input field
-	#var key_input = LineEdit.new()
-	#key_input.placeholder_text = "sk-..."
-	#key_input.secret = true  # Mask the API key
-	#vbox.add_child(key_input)
-	#
-	#dialog.add_child(vbox)
-	#add_child(dialog)
-	#
-	## Connect the confirmation signal
-	#dialog.confirmed.connect(
-		#func():
-			#var new_key = key_input.text
-			#if new_key.begins_with("sk-"):
-				#_save_api_key(new_key)
-				#_process_ai_request()  # Retry the request
-			#dialog.queue_free()
-	#)
-	#
-	#dialog.canceled.connect(
-		#func():
-			#dialog.queue_free()
-	#)
-	#
-	#dialog.popup_centered()
-
-
-
 func _on_request_completed(response: String) -> void:
-	# This function is called for each streaming chunk
+	# Enhanced response handling with better state management
 	error_handler.log_debug("Received response chunk", {"chunk_length": str(response.length())})
-	print("Main received chunk:", response)  # Debug print
 	
-	# Add the chunk to the left editor's text
+	# Initialize streaming if this is the first chunk
 	if not is_streaming_response:
 		left_editor.text = ""  # Clear on first chunk
 		is_streaming_response = true
+		
+		# Hide the processing indicator since we're getting real data
+		var indicator = left_editor.get_node_or_null("ProcessingIndicator")
+		if indicator:
+			indicator.hide()
 	
+	# Add the chunk to the editor
 	left_editor.text += response
+	
+	# Keep the cursor at the end for live updating effect
 	left_editor.set_caret_line(left_editor.get_line_count() - 1)
-
+	left_editor.set_caret_column(left_editor.get_line(left_editor.get_line_count() - 1).length())
+	
+	# Force a redraw to ensure the text appears immediately
+	left_editor.queue_redraw()
 
 
 func _on_request_error(error_message: String) -> void:
+	# Enhanced error handling with better recovery options
 	is_streaming_response = false
 	is_processing_ai = false
-	error_handler.handle_error("invalid_request", {"details": error_message})
-	left_editor.text = "# Error: " + error_message
+	
+	# Provide more helpful error messages based on error type
+	var user_friendly_message = error_message
+	
+	if "api" in error_message.to_lower() and "key" in error_message.to_lower():
+		user_friendly_message = """# API Key Issue
+# Your API key may be missing or invalid.
+# Click the ✦ button in the menu bar, then select "API Key" to update it.
+# 
+# Original error: """ + error_message
+	elif "rate" in error_message.to_lower() and "limit" in error_message.to_lower():
+		user_friendly_message = """# Rate Limit Reached
+# You've made too many requests too quickly.
+# Please wait a moment before trying again.
+# 
+# Original error: """ + error_message
+	elif "network" in error_message.to_lower():
+		user_friendly_message = """# Network Error
+# Please check your internet connection and try again.
+# If the problem persists, the Claude API might be temporarily unavailable.
+# 
+# Original error: """ + error_message
+	else:
+		user_friendly_message = "# Error: " + error_message
+	
+	left_editor.text = user_friendly_message
+	
+	# Clean up any processing indicators
 	var indicator = left_editor.get_node_or_null("ProcessingIndicator")
 	if indicator:
 		indicator.queue_free()
@@ -1933,13 +1921,18 @@ func _handle_editor_input(event: InputEvent) -> void:
 func _submit_ai_prompt() -> void:
 	if is_processing_ai or right_editor.text.strip_edges().is_empty():
 		return
+	
+	# Reset typing state
+	is_typing = false
+	current_typing_text = ""
+	left_editor.text = ""  # Clear previous response
+	
 	error_handler.log_debug("Submitting AI prompt", {
 		"text_length": str(right_editor.text.length()),
 		"has_system_prompt": str(not system_prompt_editor.text.is_empty())
 	})
 	is_processing_ai = true
-	is_streaming_response = false  # Reset streaming state
-	left_editor.text = ""  # Clear previous response
+	is_streaming_response = false
 	_show_processing_indicator()
 	prompt_history.append(right_editor.text)
 	request_manager.queue_request(right_editor.text, system_prompt_editor.text)
@@ -1976,9 +1969,22 @@ func _show_processing_indicator() -> void:
 	var tween = create_tween()
 	tween.set_loops()
 	tween.tween_property(spinner_label, "rotation", TAU, 1.0)
+
+
+
+func _handle_ai_response(response: String):
+	# Update the output editor with the response
+	left_editor.text = response
 	
+	# Hide processing indicator
+	var indicator = left_editor.get_node_or_null("ProcessingIndicator")
+	if indicator:
+		indicator.hide()
 	
-	
+	is_processing_ai = false
+
+
+
 func _stream_response(complete_response: String) -> void:
 	is_streaming_response = true
 	current_streaming_text = complete_response
@@ -1993,13 +1999,19 @@ func _stream_next_chunk() -> void:
 		is_streaming_response = false
 		_on_stream_complete()
 		return
-	
-	# Simulate streaming by taking one character at a time.
-	var chunk_size = 1
+		
+	# Take the next chunk
+	var chunk_size = 1  # Process one character at a time
 	var chunk = current_streaming_text.substr(0, chunk_size)
 	current_streaming_text = current_streaming_text.substr(chunk_size)
-	left_editor.text += chunk
+	
+	# Insert at current caret position
 	left_editor.set_caret_line(left_editor.get_line_count() - 1)
+	left_editor.set_caret_column(left_editor.get_line(left_editor.get_line_count() - 1).length())
+	left_editor.insert_text_at_caret(chunk)
+	
+	# Scroll to keep up with new text
+	left_editor.set_v_scroll(left_editor.get_v_scroll_bar().max_value)
 
 
 
@@ -2029,6 +2041,42 @@ func _on_stream_complete() -> void:
 
 
 
+func _create_processing_indicator():
+	var indicator = HBoxContainer.new()
+	indicator.name = "ProcessingIndicator"
+	indicator.position = Vector2(10, 10)
+	
+	var spinner = TextureRect.new()  # You'll need to add a spinner texture
+	var label = Label.new()
+	label.text = "Processing..."
+	label.add_theme_color_override("font_color", COLORS.ai_mode_accent)
+	
+	indicator.add_child(spinner)
+	indicator.add_child(label)
+	left_editor.add_child(indicator)
+	indicator.hide()
+
+
+
+func _remove_processing_indicator():
+	var indicator = left_editor.get_node_or_null("ProcessingIndicator")
+	if indicator:
+		indicator.queue_free()
+	is_processing_ai = false
+
+
+
+
+
+
+
+
+
+
+
+
+###########################
+##COMPARING FUNCTIONALITY##
 func _highlight_differences():
 	# Store text from both editors
 	var left_lines = left_editor.text.split("\n")
@@ -2110,6 +2158,23 @@ func _count_differences() -> Dictionary:
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+###########################
+##STATUS BAR CREATION######
 func _create_status_bar() -> void:
 	# First, remove any existing status bar
 	var existing_status_bar = root_container.get_node_or_null("StatusBar")
@@ -2187,9 +2252,9 @@ func _create_status_bar() -> void:
 	
 	# Schedule a deferred update to ensure proper layout
 	call_deferred("_ensure_status_bar_visibility")
-	
-	
-# Add this new helper function
+
+
+
 func _ensure_status_bar_visibility() -> void:
 	if status_bar:
 		# Force the status bar to the front
@@ -2210,7 +2275,7 @@ func _ensure_status_bar_visibility() -> void:
 		print("- File info visible: ", file_info.visible)
 
 
-# Update the status info update function
+
 func _update_status_info() -> void:
 	# Safety check for null references
 	if not is_instance_valid(status_bar) or not is_instance_valid(mode_indicator) or \
@@ -2253,103 +2318,363 @@ func _update_status_bar(stats: Dictionary):
 
 
 
-func _create_mode_transition_effects():
-	# Create a transition overlay
-	var overlay = ColorRect.new()
-	overlay.name = "ModeTransitionOverlay"
-	overlay.set_anchors_preset(Control.PRESET_FULL_RECT)
-	overlay.color = Color(0, 0, 0, 0)
-	overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	add_child(overlay)
+func _update_editor_labels(left_label: String, right_label: String):
+	# We'll create labels if they don't exist, update them if they do
+	var left_header = left_editor.get_node_or_null("Header")
+	var right_header = right_editor.get_node_or_null("Header")
 	
-	# Create floating indicators for the new mode
-	var indicator_container = Control.new()
-	indicator_container.set_anchors_preset(Control.PRESET_FULL_RECT)
-	indicator_container.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	add_child(indicator_container)
+	if not left_header:
+		left_header = Label.new()
+		left_header.name = "Header"
+		left_header.add_theme_font_size_override("font_size", 14)
+		left_editor.add_child(left_header)
+		left_header.position = Vector2(10, -25)
 	
-	return {
-		"overlay": overlay,
-		"container": indicator_container
+	if not right_header:
+		right_header = Label.new()
+		right_header.name = "Header"
+		right_header.add_theme_font_size_override("font_size", 14)
+		right_editor.add_child(right_header)
+		right_header.position = Vector2(10, -25)
+	
+	left_header.text = left_label
+	right_header.text = right_label
+
+
+
+
+
+
+
+
+
+
+
+
+
+#######################################
+##CORE EDITOR FUNCTIONALITY AND SETUP##
+# Enhanced syntax highlighting functions for main.gd
+# Replace the existing _configure_syntax_highlighting and related functions with these:
+
+func _configure_syntax_highlighting(highlighter: CodeHighlighter, is_dark: bool = true):
+	# IMPORTANT: Remove the incorrect line that caused the error
+	# highlighter.font_color = COLORS.TEXT  # This doesn't exist in CodeHighlighter!
+	
+	# The correct approach: Let the CodeEdit handle base font color through theme
+	# The highlighter only handles specific syntax element colors
+	
+	# Define color schemes with explicit fallback colors
+	const DARK_COLORS = {
+		"SYMBOL": Color("#abc9ff"),      # Light blue for symbols/operators
+		"KEYWORD": Color("#ff7085"),     # Pink for keywords
+		"CONTROL": Color("#ff8ccc"),     # Light pink for control flow
+		"BASE_TYPE": Color("#42ffc2"),   # Bright green for base types
+		"ENGINE_TYPE": Color("#8fffdb"), # Lighter green for engine types
+		"USER_TYPE": Color("#c7ffed"),   # Pale green for user types
+		"COMMENT": Color("#676767"),     # Gray for comments
+		"DOC_COMMENT": Color("#99b3cc"), # Blue-gray for doc comments
+		"STRING": Color("#ffeda1"),      # Light yellow for strings
+		"TEXT": Color("#ffffff"),        # White for regular text (used by editor, not highlighter)
+		"FUNCTION_DEF": Color("#66e6ff"), # Function definitions
+		"FUNCTION": Color("#57b3ff"),     # Functions
+		"GLOBAL_FUNC": Color("#a3a3f5"),  # Global functions
+		"NODE_REF": Color("#63c259"),     # Node references
+		"MEMBER_VAR": Color("#bce0ff"),   # Member variables
+		"NUMBER": Color("#b5cea8"),       # Numbers
+		"OPERATOR": Color("#d4d4d4")      # Operators
 	}
-
-
-
-func _enhance_mode_transition():
-	var effects = _create_mode_transition_effects()
 	
-	# Create a multi-stage transition
-	var tween = create_tween()
-	tween.set_parallel(true)
+	const LIGHT_COLORS = {
+		"SYMBOL": Color("#0066cc"),      # Blue for symbols/operators
+		"KEYWORD": Color("#d73a49"),     # Red for keywords
+		"CONTROL": Color("#b31d28"),     # Dark red for control flow
+		"BASE_TYPE": Color("#22863a"),   # Dark green for base types
+		"ENGINE_TYPE": Color("#005cc5"), # Blue for engine types
+		"USER_TYPE": Color("#6f42c1"),   # Purple for user types
+		"COMMENT": Color("#6a737d"),     # Gray for comments
+		"DOC_COMMENT": Color("#6a737d"), # Gray for doc comments
+		"STRING": Color("#032f62"),      # Dark blue for strings
+		"TEXT": Color("#24292e"),        # Dark gray for regular text
+		"FUNCTION_DEF": Color("#6f42c1"), # Purple for function definitions
+		"FUNCTION": Color("#005cc5"),     # Blue for functions
+		"GLOBAL_FUNC": Color("#e36209"),  # Orange for global functions
+		"NODE_REF": Color("#22863a"),     # Green for node references
+		"MEMBER_VAR": Color("#005cc5"),   # Blue for member variables
+		"NUMBER": Color("#005cc5"),       # Blue for numbers
+		"OPERATOR": Color("#d73a49")      # Red for operators
+	}
 	
-	if ai_mode_active:
-		# First stage: Fade in overlay
-		tween.tween_property(effects.overlay, "color", 
-			Color(COLORS.ai_mode_background.r, 
-				  COLORS.ai_mode_background.g, 
-				  COLORS.ai_mode_background.b, 0.2), 0.3)
+	# Choose the appropriate color scheme
+	var COLORS = DARK_COLORS if is_dark else LIGHT_COLORS
+	
+	# Clear any existing highlighting to start fresh
+	highlighter.clear_keyword_colors()
+	highlighter.clear_color_regions()
+	
+	# String literals - these need to come first to override other highlighting
+	highlighter.add_color_region("\"", "\"", COLORS.STRING, false)
+	highlighter.add_color_region("'", "'", COLORS.STRING, false)
+	highlighter.add_color_region("\"\"\"", "\"\"\"", COLORS.STRING, false)
+	
+	# Comments - these also need priority
+	highlighter.add_color_region("#", "", COLORS.COMMENT, true)
+	highlighter.add_color_region("##", "", COLORS.DOC_COMMENT, true)
+	
+	# Keywords dictionary with complete GDScript coverage
+	var keywords = {
+		# Control flow keywords
+		"if": COLORS.CONTROL,
+		"elif": COLORS.CONTROL,
+		"else": COLORS.CONTROL,
+		"for": COLORS.CONTROL,
+		"while": COLORS.CONTROL,
+		"break": COLORS.CONTROL,
+		"continue": COLORS.CONTROL,
+		"pass": COLORS.CONTROL,
+		"return": COLORS.CONTROL,
+		"match": COLORS.CONTROL,
+		"when": COLORS.CONTROL,
 		
-		# Create floating AI indicators
-		var indicators = _create_ai_mode_indicators(effects.container)
+		# Declaration keywords
+		"func": COLORS.KEYWORD,
+		"class": COLORS.KEYWORD,
+		"class_name": COLORS.KEYWORD,
+		"extends": COLORS.KEYWORD,
+		"static": COLORS.KEYWORD,
+		"enum": COLORS.KEYWORD,
 		
-		# Animate indicators
-		for indicator in indicators:
-			tween.tween_property(indicator, "position:y", 
-				indicator.position.y - 50, 0.5)
-			tween.tween_property(indicator, "modulate:a", 
-				0.0, 0.5)
-	else:
-		# Transition back to normal mode
-		tween.tween_property(effects.overlay, "color", 
-			Color(0, 0, 0, 0), 0.3)
+		# Variable keywords
+		"var": COLORS.KEYWORD,
+		"const": COLORS.KEYWORD,
+		"signal": COLORS.KEYWORD,
+		"export": COLORS.KEYWORD,
+		"@export": COLORS.KEYWORD,
+		"@onready": COLORS.KEYWORD,
+		"@tool": COLORS.KEYWORD,
+		
+		# Built-in types
+		"bool": COLORS.BASE_TYPE,
+		"int": COLORS.BASE_TYPE,
+		"float": COLORS.BASE_TYPE,
+		"String": COLORS.BASE_TYPE,
+		"StringName": COLORS.BASE_TYPE,
+		"Array": COLORS.BASE_TYPE,
+		"Dictionary": COLORS.BASE_TYPE,
+		"Variant": COLORS.BASE_TYPE,
+		"void": COLORS.BASE_TYPE,
+		
+		# Engine types
+		"Vector2": COLORS.ENGINE_TYPE,
+		"Vector2i": COLORS.ENGINE_TYPE,
+		"Vector3": COLORS.ENGINE_TYPE,
+		"Vector3i": COLORS.ENGINE_TYPE,
+		"Transform2D": COLORS.ENGINE_TYPE,
+		"Transform3D": COLORS.ENGINE_TYPE,
+		"Color": COLORS.ENGINE_TYPE,
+		"NodePath": COLORS.ENGINE_TYPE,
+		"Node": COLORS.ENGINE_TYPE,
+		"Node2D": COLORS.ENGINE_TYPE,
+		"Node3D": COLORS.ENGINE_TYPE,
+		"Control": COLORS.ENGINE_TYPE,
+		"Resource": COLORS.ENGINE_TYPE,
+		"PackedScene": COLORS.ENGINE_TYPE,
+		"Texture2D": COLORS.ENGINE_TYPE,
+		"RigidBody2D": COLORS.ENGINE_TYPE,
+		"CharacterBody2D": COLORS.ENGINE_TYPE,
+		"AnimationPlayer": COLORS.ENGINE_TYPE,
+		"CollisionShape2D": COLORS.ENGINE_TYPE,
+		"Area2D": COLORS.ENGINE_TYPE,
+		"Timer": COLORS.ENGINE_TYPE,
+		"HTTPRequest": COLORS.ENGINE_TYPE,
+		"FileAccess": COLORS.ENGINE_TYPE,
+		"Input": COLORS.ENGINE_TYPE,
+		"OS": COLORS.ENGINE_TYPE,
+		"Time": COLORS.ENGINE_TYPE,
+		"Rect2": COLORS.ENGINE_TYPE,
+		"Rect2i": COLORS.ENGINE_TYPE,
+		"Callable": COLORS.ENGINE_TYPE,
+		"Signal": COLORS.ENGINE_TYPE,
+		
+		# Special keywords
+		"self": COLORS.KEYWORD,
+		"super": COLORS.KEYWORD,
+		"null": COLORS.KEYWORD,
+		"true": COLORS.KEYWORD,
+		"false": COLORS.KEYWORD,
+		"and": COLORS.OPERATOR,
+		"or": COLORS.OPERATOR,
+		"not": COLORS.OPERATOR,
+		"in": COLORS.OPERATOR,
+		"is": COLORS.OPERATOR,
+		"as": COLORS.OPERATOR,
+		"await": COLORS.KEYWORD,
+		"yield": COLORS.KEYWORD
+	}
 	
-	# Cleanup after transition
-	tween.tween_callback(func():
-		effects.overlay.queue_free()
-		effects.container.queue_free()
-	)
-
-
-
-func _create_ai_mode_indicators(container: Control) -> Array:
-	var indicators = []
-	var phrases = [
-		"AI Analysis Mode",
-		"Ask questions in comments",
-		"Press Enter to analyze"
+	# Apply all keyword colors
+	for keyword in keywords:
+		highlighter.add_keyword_color(keyword, keywords[keyword])
+	
+	# Numbers - improved regex patterns
+	highlighter.add_keyword_color("\\b\\d+\\b", COLORS.NUMBER)
+	highlighter.add_keyword_color("\\b\\d+\\.\\d+\\b", COLORS.NUMBER)
+	highlighter.add_keyword_color("\\b0x[0-9a-fA-F]+\\b", COLORS.NUMBER)
+	highlighter.add_keyword_color("\\b\\d+e[+-]?\\d+\\b", COLORS.NUMBER)
+	
+	# Operators and symbols
+	var operators = [
+		"\\+", "\\-", "\\*", "\\/", "\\%", "\\=", 
+		"\\<", "\\>", "\\!", "\\&", "\\|", "\\^",
+		"\\+=", "\\-=", "\\*=", "\\/=", "\\%=",
+		"\\==", "\\!=", "\\<=", "\\>=", "\\<\\>",
+		"\\&\\&", "\\|\\|", "\\<\\<", "\\>\\>",
+		"\\-\\>", "\\:\\:", "\\?\\?"
 	]
 	
-	for i in range(phrases.size()):
-		var label = Label.new()
-		label.text = phrases[i]
-		label.add_theme_color_override("font_color", COLORS.ai_mode_accent)
-		label.position = Vector2(
-			randf_range(100, get_viewport_rect().size.x - 200),
-			randf_range(100, get_viewport_rect().size.y - 100)
-		)
-		container.add_child(label)
-		indicators.append(label)
+	for operator in operators:
+		highlighter.add_keyword_color(operator, COLORS.OPERATOR)
 	
-	return indicators
+	# Function definitions
+	highlighter.add_keyword_color("(?<=func\\s+)\\w+(?=\\s*\\()", COLORS.FUNCTION_DEF)
+	
+	# Function calls
+	highlighter.add_keyword_color("\\b\\w+(?=\\s*\\()", COLORS.FUNCTION)
+	
+	# Global functions (starting with underscore)
+	highlighter.add_keyword_color("\\b_\\w+(?=\\s*\\()", COLORS.GLOBAL_FUNC)
+	
+	# Node references (paths)
+	highlighter.add_keyword_color("\\$[\\w/\\-]+", COLORS.NODE_REF)
+	highlighter.add_keyword_color("%[\\w/\\-]+", COLORS.NODE_REF)
+	
+	# Member variables and properties
+	highlighter.add_keyword_color("(?<=\\.)\\w+\\b(?!\\s*\\()", COLORS.MEMBER_VAR)
+	
+
+# Fix the black text issue by being more aggressive about color application
+func _create_styled_editor() -> CodeEdit:
+	var editor = CodeEdit.new()
+	editor.set_h_size_flags(Control.SIZE_EXPAND_FILL)
+	editor.set_v_size_flags(Control.SIZE_EXPAND_FILL)
+	
+	# Apply Material Design styling to the editor
+	var editor_style = StyleBoxFlat.new()
+	editor_style.bg_color = COLORS.code_background
+	editor_style.corner_radius_top_left = 4
+	editor_style.corner_radius_top_right = 4
+	editor_style.corner_radius_bottom_left = 4
+	editor_style.corner_radius_bottom_right = 4
+	editor_style.shadow_color = COLORS.elevation_1
+	editor_style.shadow_size = 2
+	editor_style.content_margin_left = 8
+	editor_style.content_margin_right = 8
+	editor_style.content_margin_top = 8
+	editor_style.content_margin_bottom = 8
+	
+	editor.add_theme_stylebox_override("normal", editor_style)
+	
+	# AGGRESSIVE COLOR FIXING - Clear any existing overrides first
+	editor.remove_theme_color_override("font_color")
+	editor.remove_theme_color_override("font_selected_color")
+	editor.remove_theme_color_override("caret_color")
+	
+	# Force the white color explicitly
+	editor.add_theme_color_override("font_color", Color.WHITE)
+	editor.add_theme_color_override("font_selected_color", Color.WHITE)
+	editor.add_theme_color_override("caret_color", Color.WHITE)
+	editor.add_theme_color_override("selection_color", Color(0.2, 0.4, 0.8, 0.3))
+	editor.add_theme_color_override("line_number_color", Color(1.0, 1.0, 1.0, 0.6))
+	editor.add_theme_color_override("current_line_color", Color(0.2, 0.4, 0.8, 0.1))
+	
+	# Basic editor settings
+	editor.gutters_draw_line_numbers = true
+	editor.minimap_draw = false
+	editor.draw_tabs = true
+	editor.draw_spaces = false
+	editor.highlight_current_line = true
+	editor.add_theme_constant_override("line_spacing", 6)
+	
+	# DON'T apply syntax highlighter yet - let's see if base white text works first
+	print("Created editor with explicit white font color")
+	
+	return editor
 
 
 
-func _on_format_pressed() -> void:
-	# Implement code formatting logic here
-	print("Format button pressed")
+# Simplified syntax highlighting setup - let's test step by step
+func _apply_basic_syntax_highlighting(editor: CodeEdit):
+	# Only apply this AFTER confirming white text works
+	var highlighter = CodeHighlighter.new()
+	
+	# Start with just a few basic rules to test
+	highlighter.add_color_region("#", "", Color("#676767"), true)  # Comments
+	highlighter.add_color_region("\"", "\"", Color("#ffeda1"), false)  # Strings
+	
+	# Just a few keywords to test
+	highlighter.add_keyword_color("func", Color("#ff7085"))
+	highlighter.add_keyword_color("var", Color("#ff7085"))
+	highlighter.add_keyword_color("if", Color("#ff8ccc"))
+	highlighter.add_keyword_color("else", Color("#ff8ccc"))
+	
+	editor.syntax_highlighter = highlighter
+	print("Applied basic syntax highlighting")
 
 
 
-func _on_copy_changes_pressed() -> void:
-	# Implement copy changes logic here
-	print("Copy changes button pressed")
+# Enhanced refresh function that properly resets colors
+func _refresh_syntax_highlighting() -> void:
+	var is_dark = true  # Get this from your view menu
+	if is_instance_valid(view_menu_button):
+		is_dark = view_menu_button.get_popup().is_item_checked(2)
+	
+	# Determine colors based on theme
+	var text_color = COLORS.code_text if is_dark else Color("#24292e")
+	var bg_color = COLORS.code_background if is_dark else Color("#ffffff")
+	
+	# Update both editors with proper color inheritance
+	for editor in [left_editor, right_editor]:
+		if not is_instance_valid(editor):
+			continue
+			
+		# STEP 1: Update background
+		var style = editor.get_theme_stylebox("normal").duplicate()
+		style.bg_color = bg_color
+		editor.add_theme_stylebox_override("normal", style)
+		
+		# STEP 2: CRITICAL - Update font colors on the EDITOR (not highlighter)
+		editor.add_theme_color_override("font_color", text_color)
+		editor.add_theme_color_override("font_selected_color", text_color)
+		editor.add_theme_color_override("caret_color", text_color)
+		editor.add_theme_color_override("line_number_color", Color(text_color.r, text_color.g, text_color.b, 0.6))
+		
+		# STEP 3: Create fresh syntax highlighter
+		var highlighter = CodeHighlighter.new()
+		_configure_syntax_highlighting(highlighter, is_dark)
+		editor.syntax_highlighter = highlighter
+		
+		# STEP 4: Force refresh
+		editor.queue_redraw()
+	
+	print("Refreshed syntax highlighting. Dark mode: ", is_dark, " Text color: ", text_color)
 
 
 
-func _on_ai_analyze_pressed() -> void:
-	# Implement AI analysis logic here
-	toggle_ai_mode()
+# Debug function to help diagnose color issues
+func _debug_editor_colors():
+	print("=== EDITOR COLOR DEBUG ===")
+	if left_editor:
+		print("Left editor font color: ", left_editor.get_theme_color("font_color"))
+		print("Left editor has theme: ", left_editor.theme != null)
+	if right_editor:
+		print("Right editor font color: ", right_editor.get_theme_color("font_color"))
+		print("Right editor has theme: ", right_editor.theme != null)
+	print("COLORS.code_text: ", COLORS.code_text)
+	print("========================")
 
+# Call this debug function in your _ready() to see what's happening
+# Add this line at the end of _ready():
+# call_deferred("_debug_editor_colors")
 
 
 func _handle_shift_enter() -> void:
@@ -2381,9 +2706,9 @@ func _handle_shift_enter() -> void:
 	# Move cursor to the start of the new line (after indentation)
 	right_editor.set_caret_line(current_line + 1)
 	right_editor.set_caret_column(indentation.length())
-	
-	
-	
+
+
+
 func _clear_editor(editor: CodeEdit):
 	editor.text = ""
 	if editor == left_editor:
@@ -2393,80 +2718,130 @@ func _clear_editor(editor: CodeEdit):
 	_update_status_info()
 
 
-func _on_search_submitted(_text: String):
-	_find_next()
-	
-
-
-
-
-
-
-func _highlight_all_matches():
-	var search_text = search_bar.text
-	if search_text.is_empty():
-		return
-	
-	for position in search_results:
-		_highlight_match(position, search_text.length(), false)
-
-
-
-func _highlight_match(position: int, length: int, is_current: bool = false):
-	var text = active_editor.text
-	var line = 0
-	var current_pos = 0
-	
-	# Find the line number
-	while current_pos < position:
-		var newline_pos = text.find("\n", current_pos)
-		if newline_pos == -1 or newline_pos >= position:
-			break
-		line += 1
-		current_pos = newline_pos + 1
-	
-	# Calculate column start and end
-	var column_start = position - current_pos
-	var column_end = column_start + length
-	
-	# For the current match, we use select() to highlight it
-	# CodeEdit only supports one selection at a time
-	if is_current:
-		active_editor.select(line, column_start, line, column_end)
-		
-		# Also set the caret position to make it visible
-		active_editor.set_caret_line(line)
-		active_editor.set_caret_column(column_end)
-	
-	# For non-current matches, we unfortunately cannot highlight them
-	# as CodeEdit doesn't support multiple selections or custom text highlighting
-	# We could potentially implement this using syntax highlighting or custom drawing
-	# but that would be more complex and require additional setup
-
-
-func _clear_search_highlights():
-	if active_editor:
-		# Simply selecting an empty range effectively clears the selection
-		active_editor.select(0, 0, 0, 0)
-		
-		
-		
-func _update_match_count():
-	if match_label:  # Check if the label exists
-		if search_results.is_empty():
-			match_label.text = "No matches"
-		else:
-			match_label.text = "%d/%d matches" % [current_search_index + 1, search_results.size()]
-
-
-
-# Add a new function to handle styling the current selection
-func _update_selection_colors():
-	# Set selection colors
-	active_editor.add_theme_color_override("selection_color", Color(0.4, 0.6, 0.8, 0.3))  # Light blue
-	active_editor.add_theme_color_override("font_selected_color", COLORS.code_text)
-
 
 
 func _show_api_key_dialog() -> void:
+	# Show a more informative dialog about the missing API key
+	if not api_settings:
+		push_error("API settings dialog not initialized!")
+		return
+		
+	# Check if we're already showing the dialog
+	if api_settings.visible:
+		return
+		
+	# Show the API settings dialog with better messaging
 	api_settings.popup_centered()
+	
+	# Ensure it gets focus
+	api_settings.grab_focus()
+
+
+##What is this?
+func _apply_theme(dark_theme: bool):
+	var editor_style = StyleBoxFlat.new()
+	
+	if dark_theme:
+		editor_style.bg_color = COLORS.code_background
+		# Refresh syntax highlighting with dark theme colors
+		_refresh_syntax_highlighting()
+	else:
+		editor_style.bg_color = Color("ffffff")
+		# Refresh syntax highlighting with light theme colors
+		_refresh_syntax_highlighting()
+	
+	# Apply the style to both editors
+	editor_style.corner_radius_top_left = 4
+	editor_style.corner_radius_top_right = 4
+	editor_style.corner_radius_bottom_left = 4
+	editor_style.corner_radius_bottom_right = 4
+	
+	left_editor.add_theme_stylebox_override("normal", editor_style.duplicate())
+	right_editor.add_theme_stylebox_override("normal", editor_style.duplicate())
+
+
+
+func _load_system_prompt_from_file():
+	# Allow users to load system prompts from files
+	var file_dialog = FileDialog.new()
+	file_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+	file_dialog.access = FileDialog.ACCESS_FILESYSTEM
+	file_dialog.title = "Load System Prompt"
+	file_dialog.add_filter("*.txt ; Text files")
+	file_dialog.add_filter("*.md ; Markdown files")
+	file_dialog.add_filter("* ; All files")
+	
+	add_child(file_dialog)
+	file_dialog.popup_centered(Vector2(600, 400))
+	
+	file_dialog.file_selected.connect(
+		func(path):
+			var file = FileAccess.open(path, FileAccess.READ)
+			if file:
+				system_prompt_editor.text = file.get_as_text()
+				print("Loaded system prompt from: ", path)
+			file_dialog.queue_free()
+	)
+
+
+
+func _save_system_prompt_to_file():
+	# Allow users to save system prompts to files
+	var file_dialog = FileDialog.new()
+	file_dialog.file_mode = FileDialog.FILE_MODE_SAVE_FILE
+	file_dialog.access = FileDialog.ACCESS_FILESYSTEM
+	file_dialog.title = "Save System Prompt"
+	file_dialog.add_filter("*.txt ; Text files")
+	file_dialog.add_filter("*.md ; Markdown files")
+	
+	add_child(file_dialog)
+	file_dialog.popup_centered(Vector2(600, 400))
+	
+	file_dialog.file_selected.connect(
+		func(path):
+			var file = FileAccess.open(path, FileAccess.WRITE)
+			if file:
+				file.store_string(system_prompt_editor.text)
+				print("Saved system prompt to: ", path)
+			file_dialog.queue_free()
+	)
+
+
+
+func _cleanup_resources():
+	# Clean up any lingering resources when switching modes or exiting
+	
+	# Clean up timers
+	if streaming_timer and is_instance_valid(streaming_timer):
+		streaming_timer.stop()
+	
+	# Clean up HTTP requests
+	if request_manager and is_instance_valid(request_manager):
+		request_manager._current_request.clear()
+	
+	# Clean up processing indicators
+	for editor in [left_editor, right_editor]:
+		if is_instance_valid(editor):
+			var indicator = editor.get_node_or_null("ProcessingIndicator")
+			if indicator:
+				indicator.queue_free()
+	
+	# Reset state variables
+	is_processing_ai = false
+	is_streaming_response = false
+	current_streaming_text = ""
+
+
+
+func _test_syntax_highlighting():
+	print("Testing syntax highlighting...")
+	print("Left editor font color: ", left_editor.get_theme_color("font_color"))
+	print("Right editor font color: ", right_editor.get_theme_color("font_color"))
+	
+	# If the above prints show white (1,1,1,1), then apply syntax highlighting
+	if left_editor.get_theme_color("font_color") == Color.WHITE:
+		print("Font color is correct, applying syntax highlighting...")
+		_apply_basic_syntax_highlighting(left_editor)
+		_apply_basic_syntax_highlighting(right_editor)
+	else:
+		print("Font color is wrong! It's: ", left_editor.get_theme_color("font_color"))

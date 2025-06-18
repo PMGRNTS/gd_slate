@@ -8,21 +8,19 @@ signal request_queued(position: int)
 signal request_started
 signal error_occurred(message: String)
 
-# Constants for API configuration
+# Updated constants for current Claude API
 const API_URL = "https://api.anthropic.com/v1/messages"
-const API_VERSION = "2023-06-01"
-const MODEL_NAME = "claude-3-5-sonnet-20241022"
+const API_VERSION = "2023-06-01"  # This is still correct
+const MODEL_NAME = "claude-3-5-sonnet-20241022"  # Updated to current model
 const MAX_REQUESTS_PER_MINUTE = 20
-#const REQUEST_TIMEOUT = 300.0  # seconds
 
 # Private variables for request management
 var _request_queue: Array = []
 var _request_history: Array = []
 var _current_request: Dictionary = {}
 var _request_timer: Timer
-var _timeout_timer: Timer
 var _response_cache: Dictionary = {}
-var _http_request: HTTPRequest  # Add HTTP request node
+var _http_request: HTTPRequest
 const MAX_CACHE_SIZE = 50
 
 # Parent node reference for API key access
@@ -30,7 +28,9 @@ var _parent_node: Node
 var _error_handler: AIErrorHandler
 var _api_key: String = ""
 
-
+# Add streaming state tracking
+var _current_response_buffer: String = ""
+var _is_streaming: bool = false
 
 func _ready():
 	# Initialize timers for request management
@@ -39,11 +39,6 @@ func _ready():
 	_request_timer.timeout.connect(_clear_old_requests)
 	add_child(_request_timer)
 	_request_timer.start()
-	
-	#_timeout_timer = Timer.new()
-	#_timeout_timer.one_shot = true
-	#_timeout_timer.timeout.connect(_handle_timeout)
-	#add_child(_timeout_timer)
 	
 	# Initialize HTTP request node for API communication
 	_http_request = HTTPRequest.new()
@@ -54,18 +49,17 @@ func _ready():
 	# Store reference to parent node for API key access
 	_parent_node = get_parent()
 	
-		# Initialize error handler reference
+	# Initialize error handler reference
 	_error_handler = get_node_or_null("/root/Control").error_handler
 	if not _error_handler:
 		push_error("Error handler not found!")
 		return
 
-
 # Create a setup function to initialize dependencies
 func setup(error_handler_ref: AIErrorHandler) -> void:
 	_error_handler = error_handler_ref
 
-# Modify the queue_request function to safely use the error handler
+# Updated queue_request function with better error handling
 func queue_request(code: String, system_prompt: String) -> void:
 	if _error_handler:
 		_error_handler.handle_error("debug", {"message": "Queue request started", "details": "Code length: " + str(code.length())})
@@ -100,7 +94,6 @@ func _process_next_request() -> void:
 	
 	_current_request = _request_queue.pop_front()
 	request_started.emit()
-	#_timeout_timer.start(REQUEST_TIMEOUT)
 	_make_api_request(_current_request)
 
 func _make_api_request(request: Dictionary) -> void:
@@ -128,12 +121,13 @@ func _make_api_request(request: Dictionary) -> void:
 		}
 	]
 	
-	# Create the request body
+	# Create the request body with updated parameters
 	var body = {
 		"model": MODEL_NAME,
 		"messages": messages,
 		"max_tokens": 4096,
-		"stream": true
+		"stream": true,
+		"temperature": 0.7  # Add some creativity for code suggestions
 	}
 	
 	# Add system prompt if it exists
@@ -141,6 +135,10 @@ func _make_api_request(request: Dictionary) -> void:
 		body["system"] = request["system_prompt"]
 	
 	print("Request body:", JSON.stringify(body))  # Debug print
+	
+	# Reset streaming state
+	_current_response_buffer = ""
+	_is_streaming = false
 	
 	var error = _http_request.request(API_URL, headers, HTTPClient.METHOD_POST, JSON.stringify(body))
 	if error != OK:
@@ -150,29 +148,47 @@ func _make_api_request(request: Dictionary) -> void:
 		
 	_error_handler.log_debug("Request sent successfully")
 
-
-
+# Improved response handling for current Claude API format
 func _on_http_request_completed(result: int, response_code: int, headers: PackedStringArray, body: PackedByteArray) -> void:
 	print("=== Starting response processing ===")
+	print("Response code:", response_code)
+	print("Result:", result)
+	
+	# Handle different response codes
+	if response_code != 200:
+		var error_msg = "API request failed with code: " + str(response_code)
+		if response_code == 401:
+			error_msg = "Invalid API key. Please check your settings."
+		elif response_code == 429:
+			error_msg = "Rate limit exceeded. Please try again later."
+		elif response_code >= 500:
+			error_msg = "Server error. Please try again later."
+		
+		error_occurred.emit(error_msg)
+		_current_request = {}
+		return
 	
 	var response_text = body.get_string_from_utf8()
-	print("Raw response text (first 100 chars):", response_text.substr(0, 100))
+	print("Raw response text (first 200 chars):", response_text.substr(0, 200))
 	
 	var lines = response_text.split("\n")
+	var complete_response = ""
+	
 	for line in lines:
 		if line.is_empty():
 			continue
 			
 		print("Processing line:", line)
 		
-		# Check if it's a data line
+		# Check if it's a data line for server-sent events
 		if line.begins_with("data: "):
 			var json_str = line.substr(6)  # Remove "data: " prefix
 			
 			# Handle stream end marker
 			if json_str == "[DONE]":
 				print("Found end of stream marker")
-				continue
+				_finish_streaming_response(complete_response)
+				return
 				
 			print("Parsing JSON:", json_str)
 			
@@ -183,18 +199,67 @@ func _on_http_request_completed(result: int, response_code: int, headers: Packed
 				var response_data = json.get_data()
 				print("Response data:", response_data)
 				
-				# For Claude 3, the content is in delta.text for streaming
-				if response_data.has("delta") and response_data["delta"].has("text"):
-					var chunk = response_data["delta"]["text"]
-					print("Found text chunk:", chunk)
-					request_completed.emit(chunk)
-					_error_handler.log_debug("Emitted chunk", {"length": str(chunk.length())})
+				# Handle different types of streaming chunks
+				if response_data.has("type"):
+					match response_data["type"]:
+						"message_start":
+							_is_streaming = true
+							print("Message started")
+						"content_block_start":
+							print("Content block started")
+						"content_block_delta":
+							if response_data.has("delta") and response_data["delta"].has("text"):
+								var chunk = response_data["delta"]["text"]
+								print("Found text chunk:", chunk)
+								complete_response += chunk
+								request_completed.emit(chunk)
+								_error_handler.log_debug("Emitted chunk", {"length": str(chunk.length())})
+						"content_block_stop":
+							print("Content block stopped")
+						"message_delta":
+							# Handle usage information if needed
+							if response_data.has("usage"):
+								print("Usage info:", response_data["usage"])
+						"message_stop":
+							print("Message stopped")
+							_finish_streaming_response(complete_response)
+							return
+	
+	# If we get here without proper streaming, try to parse as complete response
+	if not _is_streaming:
+		_handle_complete_response(response_text)
 
-#func _handle_timeout() -> void:
-	#if _current_request:
-		#error_occurred.emit("Request timed out after %d seconds" % REQUEST_TIMEOUT)
-		#_current_request = {}
-		#_process_next_request()
+func _finish_streaming_response(complete_response: String) -> void:
+	# Cache the complete response
+	if _current_request.has("code") and _current_request.has("system_prompt"):
+		_cache_response(_current_request["code"], _current_request["system_prompt"], complete_response)
+	
+	# Add to request history
+	_request_history.push_back(_current_request)
+	_current_request = {}
+	_is_streaming = false
+	
+	# Process next request if any
+	_process_next_request()
+
+func _handle_complete_response(response_text: String) -> void:
+	# Fallback for non-streaming responses
+	var json = JSON.new()
+	var parse_result = json.parse(response_text)
+	
+	if parse_result == OK:
+		var response_data = json.get_data()
+		if response_data.has("content") and response_data["content"].size() > 0:
+			var content = response_data["content"][0]
+			if content.has("text"):
+				var text = content["text"]
+				request_completed.emit(text)
+				_finish_streaming_response(text)
+				return
+	
+	# If parsing fails, emit error
+	error_occurred.emit("Failed to parse API response")
+	_current_request = {}
 
 func _clear_old_requests() -> void:
 	var current_time = Time.get_unix_time_from_system()
