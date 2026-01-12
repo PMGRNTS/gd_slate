@@ -70,6 +70,8 @@ var text_animator: JuicyTextAnimator
 var typing_speed: float = 0.002  # Seconds per character
 var current_typing_text: String = ""
 var is_typing: bool = false
+var _left_scroll_callable: Callable
+var _right_scroll_callable: Callable
 
 # Material Design color palette
 const COLORS = {
@@ -95,29 +97,78 @@ const API_KEY_SHORTCUT_KEY = KEY_R
 
 
 func _ready():
-	# Initialize error handler (only one instance)
+	# 1. Core systems first
 	error_handler = AIErrorHandler.new()
 	add_child(error_handler)
 	
-  # Initialize the request manager with error handler and API key
 	request_manager = AIRequestManager.new()
 	add_child(request_manager)
 	request_manager.setup(error_handler)
 	request_manager.request_completed.connect(_on_request_completed)
 	request_manager.error_occurred.connect(_on_request_error)
 	
-	# Initialize API settings but don't show it
+	# 2. API settings (invisible, but needed early)
 	api_settings = APISettings.new()
 	api_settings.api_key_saved.connect(_on_api_key_saved)
 	add_child(api_settings)
 	api_settings.hide()
-	# Load the API key silently and pass it to request manager
 	api_key = api_settings.get_api_key()
-	request_manager.set_api_key(api_key)  # Add this new line
+	request_manager.set_api_key(api_key)
 	
-	# First, ensure we have the basic structure
-	# Create our root container if it doesn't exist
-	if not has_node("RootContainer"):
+	# 3. UI structure
+	_setup_root_container()
+	self.theme = _create_material_theme()
+	
+	var menu_container := _create_unified_menu_bar()
+	root_container.add_child(menu_container)
+	
+	var main_container := HSplitContainer.new()
+	main_container.name = "MainContainer"
+	main_container.set_h_size_flags(Control.SIZE_EXPAND_FILL)
+	main_container.set_v_size_flags(Control.SIZE_EXPAND_FILL)
+	main_container.add_theme_constant_override("separation", 16)
+	root_container.add_child(main_container)
+	
+	# 4. Editors
+	left_editor = _create_styled_editor()
+	right_editor = _create_styled_editor()
+	main_container.add_child(left_editor)
+	main_container.add_child(right_editor)
+	
+	# 5. Editor features (after editors exist)
+	_setup_editor_features()
+	_setup_search_bar()
+	_setup_system_prompt_panel()
+	
+	# 6. Input handling
+	_setup_input_shortcuts()
+	_setup_system_prompt_shortcut()
+	
+	# 7. Timers
+	streaming_timer = Timer.new()
+	streaming_timer.one_shot = false
+	streaming_timer.wait_time = 0.05
+	streaming_timer.timeout.connect(_stream_next_chunk)
+	add_child(streaming_timer)
+	
+	# 8. Final editor signal connections
+	right_editor.gui_input.connect(_handle_editor_input)
+	left_editor.text_changed.connect(_on_text_changed)
+	right_editor.text_changed.connect(_on_text_changed)
+	
+	# 9. Deferred setup (needs full scene tree)
+	call_deferred("_create_status_bar")
+	call_deferred("_refresh_syntax_highlighting")
+	
+# Comment out until we implement animated streaming
+# text_animator = JuicyTextAnimator.new(left_editor)
+# add_child(text_animator)
+
+
+func _setup_root_container():
+	if has_node("RootContainer"):
+		root_container = get_node("RootContainer")
+	else:
 		root_container = VBoxContainer.new()
 		root_container.name = "RootContainer"
 		root_container.set_anchors_preset(Control.PRESET_FULL_RECT)
@@ -125,78 +176,6 @@ func _ready():
 		root_container.set_v_size_flags(Control.SIZE_FILL)
 		root_container.set_clip_contents(true)
 		add_child(root_container)
-	else:
-		root_container = get_node("RootContainer")
-	
-	# Now we can safely continue with the rest of the initialization
-	var ide_theme = _create_material_theme()
-	self.theme = ide_theme
-	
-	var menu_container = _create_unified_menu_bar()
-	root_container.add_child(menu_container)
-	
-	var main_container = HSplitContainer.new()
-	main_container.name = "MainContainer"
-	main_container.set_h_size_flags(Control.SIZE_EXPAND_FILL)
-	main_container.set_v_size_flags(Control.SIZE_EXPAND_FILL)
-	main_container.add_theme_constant_override("separation", 16)
-	root_container.add_child(main_container)
-	
-	# Create editors WITHOUT syntax highlighting first
-	left_editor = _create_styled_editor()
-	# Don't add syntax highlighting yet
-	
-	right_editor = _create_styled_editor()
-	# Don't add syntax highlighting yet
-	
-	# Add them to your container
-	main_container.add_child(left_editor)
-	main_container.add_child(right_editor)
-	
-	# Test with some text to see if it's white
-	left_editor.text = "# This should be white text\nfunc test():\n\tvar x = 42\n\tprint(x)"
-	right_editor.text = "# This should also be white\nfunc another_test():\n\tvar y = \"hello\"\n\tprint(y)"
-	
-	# Wait a moment, then apply syntax highlighting
-	call_deferred("_test_syntax_highlighting")
-	
-	text_animator = JuicyTextAnimator.new(left_editor)
-	add_child(text_animator)
-	
-	# Now that our basic structure is in place, we can set up the rest
-	_setup_editor_features()
-	_setup_input_shortcuts()
-	_setup_search_bar()
-	_setup_system_prompt_panel()
-	_setup_system_prompt_shortcut()
-	
-	# Initialize the streaming timer
-	streaming_timer = Timer.new()
-	streaming_timer.one_shot = false
-	streaming_timer.wait_time = 0.05  # 50ms between chunks
-	streaming_timer.timeout.connect(_stream_next_chunk)
-	add_child(streaming_timer)
-	
-	# Connect editor signals
-	right_editor.gui_input.connect(_handle_editor_input)
-	left_editor.text_changed.connect(_on_text_changed)
-	right_editor.text_changed.connect(_on_text_changed)
-	
-	#_load_api_key()
-	
-	
-	var api_settings_shortcut = Shortcut.new()
-	var api_settings_event = InputEventKey.new()
-	api_settings_event.keycode = KEY_R
-	api_settings_event.ctrl_pressed = true
-	api_settings_shortcut.events.push_back(api_settings_event)
-	
-	
-	# Create the status bar LAST, after everything else is set up
-	call_deferred("_create_status_bar")
-	call_deferred("_refresh_syntax_highlighting")
-
-
 
 func _setup_editor_features():
 	# Initialize the active editor
@@ -213,22 +192,26 @@ func _setup_editor_features():
 
 
 func _connect_editor_signals():
-	# Connect scroll signals using the proper Godot signal system
-	left_editor.get_v_scroll_bar().value_changed.connect(_on_editor_scroll.bind(left_editor))
-	right_editor.get_v_scroll_bar().value_changed.connect(_on_editor_scroll.bind(right_editor))
-
-
+	# Create and store the bound callables
+	_left_scroll_callable = _on_editor_scroll.bind(left_editor)
+	_right_scroll_callable = _on_editor_scroll.bind(right_editor)
+	
+	var left_scroll := left_editor.get_v_scroll_bar()
+	var right_scroll := right_editor.get_v_scroll_bar()
+	
+	if not left_scroll.value_changed.is_connected(_left_scroll_callable):
+		left_scroll.value_changed.connect(_left_scroll_callable)
+	if not right_scroll.value_changed.is_connected(_right_scroll_callable):
+		right_scroll.value_changed.connect(_right_scroll_callable)
 
 func _disconnect_editor_signals():
-	# Safely disconnect scroll signals
-	var left_scroll = left_editor.get_v_scroll_bar()
-	var right_scroll = right_editor.get_v_scroll_bar()
+	var left_scroll := left_editor.get_v_scroll_bar()
+	var right_scroll := right_editor.get_v_scroll_bar()
 	
-	if left_scroll.value_changed.is_connected(_on_editor_scroll):
-		left_scroll.value_changed.disconnect(_on_editor_scroll)
-	
-	if right_scroll.value_changed.is_connected(_on_editor_scroll):
-		right_scroll.value_changed.disconnect(_on_editor_scroll)
+	if _left_scroll_callable.is_valid() and left_scroll.value_changed.is_connected(_left_scroll_callable):
+		left_scroll.value_changed.disconnect(_left_scroll_callable)
+	if _right_scroll_callable.is_valid() and right_scroll.value_changed.is_connected(_right_scroll_callable):
+		right_scroll.value_changed.disconnect(_right_scroll_callable)
 
 
 
@@ -870,7 +853,11 @@ func _on_view_menu_pressed(id: int):
 ###########
 ##AI MODE##
 func toggle_ai_mode():
-	_cleanup_resources()  # Add this line at the start
+	if not is_instance_valid(left_editor) or not is_instance_valid(right_editor):
+		push_error("Editors not initialized")
+		return
+	
+	_cleanup_resources()
 	
 	ai_mode_active = !ai_mode_active
 	current_mode = EditorMode.AI if ai_mode_active else EditorMode.COMPARE
@@ -2118,15 +2105,14 @@ func _highlight_differences():
 
 
 func _on_text_changed() -> void:
+	if not is_instance_valid(left_editor) or not is_instance_valid(right_editor):
+		return
+	
 	if current_mode == EditorMode.AI:
-		# Don't trigger AI processing for Shift+Enter
 		if is_shift_pressed:
 			return
-			
 	elif current_mode == EditorMode.COMPARE:
 		_highlight_differences()
-
-
 
 func _count_differences() -> Dictionary:
 	var left_lines = left_editor.text.split("\n")
@@ -2277,22 +2263,24 @@ func _ensure_status_bar_visibility() -> void:
 
 
 func _update_status_info() -> void:
-	# Safety check for null references
-	if not is_instance_valid(status_bar) or not is_instance_valid(mode_indicator) or \
-	   not is_instance_valid(stats_label) or not is_instance_valid(file_info):
-		print("Warning: Some status bar components are invalid")
+	if not is_instance_valid(status_bar):
+		return
+	if not is_instance_valid(mode_indicator):
+		return
+	if not is_instance_valid(stats_label):
+		return
+	if not is_instance_valid(file_info):
 		return
 	
-	# Update mode indicator
-	var mode_text = "● AI Mode" if ai_mode_active else "○ Compare Mode"
+	var mode_text := "● AI Mode" if ai_mode_active else "○ Compare Mode"
 	mode_indicator.text = mode_text
 	mode_indicator.add_theme_color_override(
 		"font_color",
 		COLORS.ai_mode_accent if ai_mode_active else COLORS.on_surface
 	)
 	
-	# Update file info with actual file names
 	file_info.text = "%s | %s" % [left_file_name, right_file_name]
+
 	
 	# Force labels to update their visibility
 	mode_indicator.show()
@@ -2352,205 +2340,82 @@ func _update_editor_labels(left_label: String, right_label: String):
 
 
 
-#######################################
-##CORE EDITOR FUNCTIONALITY AND SETUP##
-# Enhanced syntax highlighting functions for main.gd
-# Replace the existing _configure_syntax_highlighting and related functions with these:
-
 func _configure_syntax_highlighting(highlighter: CodeHighlighter, is_dark: bool = true):
-	# IMPORTANT: Remove the incorrect line that caused the error
-	# highlighter.font_color = COLORS.TEXT  # This doesn't exist in CodeHighlighter!
+	# Color definitions
+	var colors: Dictionary
+	if is_dark:
+		colors = {
+			"symbol": Color("#abc9ff"),
+			"keyword": Color("#ff7085"),
+			"control": Color("#ff8ccc"),
+			"base_type": Color("#42ffc2"),
+			"engine_type": Color("#8fffdb"),
+			"comment": Color("#676767"),
+			"doc_comment": Color("#99b3cc"),
+			"string": Color("#ffeda1"),
+			"number": Color("#b5cea8"),
+			"function": Color("#57b3ff"),
+			"member": Color("#bce0ff"),
+		}
+	else:
+		colors = {
+			"symbol": Color("#0066cc"),
+			"keyword": Color("#d73a49"),
+			"control": Color("#b31d28"),
+			"base_type": Color("#22863a"),
+			"engine_type": Color("#005cc5"),
+			"comment": Color("#6a737d"),
+			"doc_comment": Color("#6a737d"),
+			"string": Color("#032f62"),
+			"number": Color("#005cc5"),
+			"function": Color("#005cc5"),
+			"member": Color("#005cc5"),
+		}
 	
-	# The correct approach: Let the CodeEdit handle base font color through theme
-	# The highlighter only handles specific syntax element colors
-	
-	# Define color schemes with explicit fallback colors
-	const DARK_COLORS = {
-		"SYMBOL": Color("#abc9ff"),      # Light blue for symbols/operators
-		"KEYWORD": Color("#ff7085"),     # Pink for keywords
-		"CONTROL": Color("#ff8ccc"),     # Light pink for control flow
-		"BASE_TYPE": Color("#42ffc2"),   # Bright green for base types
-		"ENGINE_TYPE": Color("#8fffdb"), # Lighter green for engine types
-		"USER_TYPE": Color("#c7ffed"),   # Pale green for user types
-		"COMMENT": Color("#676767"),     # Gray for comments
-		"DOC_COMMENT": Color("#99b3cc"), # Blue-gray for doc comments
-		"STRING": Color("#ffeda1"),      # Light yellow for strings
-		"TEXT": Color("#ffffff"),        # White for regular text (used by editor, not highlighter)
-		"FUNCTION_DEF": Color("#66e6ff"), # Function definitions
-		"FUNCTION": Color("#57b3ff"),     # Functions
-		"GLOBAL_FUNC": Color("#a3a3f5"),  # Global functions
-		"NODE_REF": Color("#63c259"),     # Node references
-		"MEMBER_VAR": Color("#bce0ff"),   # Member variables
-		"NUMBER": Color("#b5cea8"),       # Numbers
-		"OPERATOR": Color("#d4d4d4")      # Operators
-	}
-	
-	const LIGHT_COLORS = {
-		"SYMBOL": Color("#0066cc"),      # Blue for symbols/operators
-		"KEYWORD": Color("#d73a49"),     # Red for keywords
-		"CONTROL": Color("#b31d28"),     # Dark red for control flow
-		"BASE_TYPE": Color("#22863a"),   # Dark green for base types
-		"ENGINE_TYPE": Color("#005cc5"), # Blue for engine types
-		"USER_TYPE": Color("#6f42c1"),   # Purple for user types
-		"COMMENT": Color("#6a737d"),     # Gray for comments
-		"DOC_COMMENT": Color("#6a737d"), # Gray for doc comments
-		"STRING": Color("#032f62"),      # Dark blue for strings
-		"TEXT": Color("#24292e"),        # Dark gray for regular text
-		"FUNCTION_DEF": Color("#6f42c1"), # Purple for function definitions
-		"FUNCTION": Color("#005cc5"),     # Blue for functions
-		"GLOBAL_FUNC": Color("#e36209"),  # Orange for global functions
-		"NODE_REF": Color("#22863a"),     # Green for node references
-		"MEMBER_VAR": Color("#005cc5"),   # Blue for member variables
-		"NUMBER": Color("#005cc5"),       # Blue for numbers
-		"OPERATOR": Color("#d73a49")      # Red for operators
-	}
-	
-	# Choose the appropriate color scheme
-	var COLORS = DARK_COLORS if is_dark else LIGHT_COLORS
-	
-	# Clear any existing highlighting to start fresh
+	# Clear existing
 	highlighter.clear_keyword_colors()
+	highlighter.clear_member_keyword_colors()
 	highlighter.clear_color_regions()
 	
-	# String literals - these need to come first to override other highlighting
-	highlighter.add_color_region("\"", "\"", COLORS.STRING, false)
-	highlighter.add_color_region("'", "'", COLORS.STRING, false)
-	highlighter.add_color_region("\"\"\"", "\"\"\"", COLORS.STRING, false)
+	# Built-in color properties (these handle the "regex-like" patterns automatically)
+	highlighter.number_color = colors.number
+	highlighter.symbol_color = colors.symbol
+	highlighter.function_color = colors.function
+	highlighter.member_variable_color = colors.member
 	
-	# Comments - these also need priority
-	highlighter.add_color_region("#", "", COLORS.COMMENT, true)
-	highlighter.add_color_region("##", "", COLORS.DOC_COMMENT, true)
+	# Color regions (delimited content)
+	highlighter.add_color_region("#", "", colors.comment, true)
+	highlighter.add_color_region("\"", "\"", colors.string, false)
+	highlighter.add_color_region("'", "'", colors.string, false)
+	highlighter.add_color_region("\"\"\"", "\"\"\"", colors.string, false)
 	
-	# Keywords dictionary with complete GDScript coverage
-	var keywords = {
-		# Control flow keywords
-		"if": COLORS.CONTROL,
-		"elif": COLORS.CONTROL,
-		"else": COLORS.CONTROL,
-		"for": COLORS.CONTROL,
-		"while": COLORS.CONTROL,
-		"break": COLORS.CONTROL,
-		"continue": COLORS.CONTROL,
-		"pass": COLORS.CONTROL,
-		"return": COLORS.CONTROL,
-		"match": COLORS.CONTROL,
-		"when": COLORS.CONTROL,
-		
-		# Declaration keywords
-		"func": COLORS.KEYWORD,
-		"class": COLORS.KEYWORD,
-		"class_name": COLORS.KEYWORD,
-		"extends": COLORS.KEYWORD,
-		"static": COLORS.KEYWORD,
-		"enum": COLORS.KEYWORD,
-		
-		# Variable keywords
-		"var": COLORS.KEYWORD,
-		"const": COLORS.KEYWORD,
-		"signal": COLORS.KEYWORD,
-		"export": COLORS.KEYWORD,
-		"@export": COLORS.KEYWORD,
-		"@onready": COLORS.KEYWORD,
-		"@tool": COLORS.KEYWORD,
-		
-		# Built-in types
-		"bool": COLORS.BASE_TYPE,
-		"int": COLORS.BASE_TYPE,
-		"float": COLORS.BASE_TYPE,
-		"String": COLORS.BASE_TYPE,
-		"StringName": COLORS.BASE_TYPE,
-		"Array": COLORS.BASE_TYPE,
-		"Dictionary": COLORS.BASE_TYPE,
-		"Variant": COLORS.BASE_TYPE,
-		"void": COLORS.BASE_TYPE,
-		
-		# Engine types
-		"Vector2": COLORS.ENGINE_TYPE,
-		"Vector2i": COLORS.ENGINE_TYPE,
-		"Vector3": COLORS.ENGINE_TYPE,
-		"Vector3i": COLORS.ENGINE_TYPE,
-		"Transform2D": COLORS.ENGINE_TYPE,
-		"Transform3D": COLORS.ENGINE_TYPE,
-		"Color": COLORS.ENGINE_TYPE,
-		"NodePath": COLORS.ENGINE_TYPE,
-		"Node": COLORS.ENGINE_TYPE,
-		"Node2D": COLORS.ENGINE_TYPE,
-		"Node3D": COLORS.ENGINE_TYPE,
-		"Control": COLORS.ENGINE_TYPE,
-		"Resource": COLORS.ENGINE_TYPE,
-		"PackedScene": COLORS.ENGINE_TYPE,
-		"Texture2D": COLORS.ENGINE_TYPE,
-		"RigidBody2D": COLORS.ENGINE_TYPE,
-		"CharacterBody2D": COLORS.ENGINE_TYPE,
-		"AnimationPlayer": COLORS.ENGINE_TYPE,
-		"CollisionShape2D": COLORS.ENGINE_TYPE,
-		"Area2D": COLORS.ENGINE_TYPE,
-		"Timer": COLORS.ENGINE_TYPE,
-		"HTTPRequest": COLORS.ENGINE_TYPE,
-		"FileAccess": COLORS.ENGINE_TYPE,
-		"Input": COLORS.ENGINE_TYPE,
-		"OS": COLORS.ENGINE_TYPE,
-		"Time": COLORS.ENGINE_TYPE,
-		"Rect2": COLORS.ENGINE_TYPE,
-		"Rect2i": COLORS.ENGINE_TYPE,
-		"Callable": COLORS.ENGINE_TYPE,
-		"Signal": COLORS.ENGINE_TYPE,
-		
-		# Special keywords
-		"self": COLORS.KEYWORD,
-		"super": COLORS.KEYWORD,
-		"null": COLORS.KEYWORD,
-		"true": COLORS.KEYWORD,
-		"false": COLORS.KEYWORD,
-		"and": COLORS.OPERATOR,
-		"or": COLORS.OPERATOR,
-		"not": COLORS.OPERATOR,
-		"in": COLORS.OPERATOR,
-		"is": COLORS.OPERATOR,
-		"as": COLORS.OPERATOR,
-		"await": COLORS.KEYWORD,
-		"yield": COLORS.KEYWORD
+	# Keywords - must be literal strings, no regex
+	var keywords := {
+		"control": ["if", "elif", "else", "for", "while", "break", "continue", 
+			"pass", "return", "match", "when"],
+		"keyword": ["func", "class", "class_name", "extends", "static", "enum",
+			"var", "const", "signal", "self", "super", "null", "true", "false",
+			"and", "or", "not", "in", "is", "as", "await", "yield",
+			"@export", "@onready", "@tool", "@icon", "@warning_ignore"],
+		"base_type": ["bool", "int", "float", "String", "StringName", "Array",
+			"Dictionary", "Variant", "void"],
+		"engine_type": ["Vector2", "Vector2i", "Vector3", "Vector3i", "Vector4",
+			"Color", "Transform2D", "Transform3D", "Basis", "Quaternion",
+			"Node", "Node2D", "Node3D", "Control", "Resource", "RefCounted",
+			"PackedScene", "Texture2D", "Timer", "HTTPRequest", "FileAccess",
+			"DirAccess", "Rect2", "Rect2i", "AABB", "Callable", "Signal",
+			"Tween", "StyleBoxFlat", "StyleBoxEmpty", "Theme", "CodeEdit",
+			"TextEdit", "LineEdit", "Label", "Button", "MenuButton",
+			"PopupMenu", "PanelContainer", "VBoxContainer", "HBoxContainer",
+			"HSplitContainer", "VSplitContainer", "MarginContainer",
+			"CodeHighlighter", "InputEventKey", "InputEventMouseButton",
+			"JSON", "RegEx", "Time", "OS", "Input", "Engine"],
 	}
 	
-	# Apply all keyword colors
-	for keyword in keywords:
-		highlighter.add_keyword_color(keyword, keywords[keyword])
-	
-	# Numbers - improved regex patterns
-	highlighter.add_keyword_color("\\b\\d+\\b", COLORS.NUMBER)
-	highlighter.add_keyword_color("\\b\\d+\\.\\d+\\b", COLORS.NUMBER)
-	highlighter.add_keyword_color("\\b0x[0-9a-fA-F]+\\b", COLORS.NUMBER)
-	highlighter.add_keyword_color("\\b\\d+e[+-]?\\d+\\b", COLORS.NUMBER)
-	
-	# Operators and symbols
-	var operators = [
-		"\\+", "\\-", "\\*", "\\/", "\\%", "\\=", 
-		"\\<", "\\>", "\\!", "\\&", "\\|", "\\^",
-		"\\+=", "\\-=", "\\*=", "\\/=", "\\%=",
-		"\\==", "\\!=", "\\<=", "\\>=", "\\<\\>",
-		"\\&\\&", "\\|\\|", "\\<\\<", "\\>\\>",
-		"\\-\\>", "\\:\\:", "\\?\\?"
-	]
-	
-	for operator in operators:
-		highlighter.add_keyword_color(operator, COLORS.OPERATOR)
-	
-	# Function definitions
-	highlighter.add_keyword_color("(?<=func\\s+)\\w+(?=\\s*\\()", COLORS.FUNCTION_DEF)
-	
-	# Function calls
-	highlighter.add_keyword_color("\\b\\w+(?=\\s*\\()", COLORS.FUNCTION)
-	
-	# Global functions (starting with underscore)
-	highlighter.add_keyword_color("\\b_\\w+(?=\\s*\\()", COLORS.GLOBAL_FUNC)
-	
-	# Node references (paths)
-	highlighter.add_keyword_color("\\$[\\w/\\-]+", COLORS.NODE_REF)
-	highlighter.add_keyword_color("%[\\w/\\-]+", COLORS.NODE_REF)
-	
-	# Member variables and properties
-	highlighter.add_keyword_color("(?<=\\.)\\w+\\b(?!\\s*\\()", COLORS.MEMBER_VAR)
-	
+	for category in keywords:
+		var color: Color = colors[category]
+		for kw in keywords[category]:
+			highlighter.add_keyword_color(kw, color)
 
 # Fix the black text issue by being more aggressive about color application
 func _create_styled_editor() -> CodeEdit:
@@ -2602,79 +2467,33 @@ func _create_styled_editor() -> CodeEdit:
 
 
 
-# Simplified syntax highlighting setup - let's test step by step
-func _apply_basic_syntax_highlighting(editor: CodeEdit):
-	# Only apply this AFTER confirming white text works
-	var highlighter = CodeHighlighter.new()
-	
-	# Start with just a few basic rules to test
-	highlighter.add_color_region("#", "", Color("#676767"), true)  # Comments
-	highlighter.add_color_region("\"", "\"", Color("#ffeda1"), false)  # Strings
-	
-	# Just a few keywords to test
-	highlighter.add_keyword_color("func", Color("#ff7085"))
-	highlighter.add_keyword_color("var", Color("#ff7085"))
-	highlighter.add_keyword_color("if", Color("#ff8ccc"))
-	highlighter.add_keyword_color("else", Color("#ff8ccc"))
-	
-	editor.syntax_highlighter = highlighter
-	print("Applied basic syntax highlighting")
-
-
-
-# Enhanced refresh function that properly resets colors
 func _refresh_syntax_highlighting() -> void:
-	var is_dark = true  # Get this from your view menu
+	var is_dark := true
 	if is_instance_valid(view_menu_button):
 		is_dark = view_menu_button.get_popup().is_item_checked(2)
 	
-	# Determine colors based on theme
-	var text_color = COLORS.code_text if is_dark else Color("#24292e")
-	var bg_color = COLORS.code_background if is_dark else Color("#ffffff")
+	var text_color := COLORS.code_text if is_dark else Color("#24292e")
+	var bg_color := COLORS.code_background if is_dark else Color("#ffffff")
 	
-	# Update both editors with proper color inheritance
 	for editor in [left_editor, right_editor]:
 		if not is_instance_valid(editor):
 			continue
-			
-		# STEP 1: Update background
-		var style = editor.get_theme_stylebox("normal").duplicate()
+		
+		# Background
+		var style: StyleBoxFlat = editor.get_theme_stylebox("normal").duplicate()
 		style.bg_color = bg_color
 		editor.add_theme_stylebox_override("normal", style)
 		
-		# STEP 2: CRITICAL - Update font colors on the EDITOR (not highlighter)
+		# Font colors
 		editor.add_theme_color_override("font_color", text_color)
 		editor.add_theme_color_override("font_selected_color", text_color)
 		editor.add_theme_color_override("caret_color", text_color)
-		editor.add_theme_color_override("line_number_color", Color(text_color.r, text_color.g, text_color.b, 0.6))
+		editor.add_theme_color_override("line_number_color", text_color * Color(1, 1, 1, 0.6))
 		
-		# STEP 3: Create fresh syntax highlighter
-		var highlighter = CodeHighlighter.new()
+		# Fresh highlighter
+		var highlighter := CodeHighlighter.new()
 		_configure_syntax_highlighting(highlighter, is_dark)
 		editor.syntax_highlighter = highlighter
-		
-		# STEP 4: Force refresh
-		editor.queue_redraw()
-	
-	print("Refreshed syntax highlighting. Dark mode: ", is_dark, " Text color: ", text_color)
-
-
-
-# Debug function to help diagnose color issues
-func _debug_editor_colors():
-	print("=== EDITOR COLOR DEBUG ===")
-	if left_editor:
-		print("Left editor font color: ", left_editor.get_theme_color("font_color"))
-		print("Left editor has theme: ", left_editor.theme != null)
-	if right_editor:
-		print("Right editor font color: ", right_editor.get_theme_color("font_color"))
-		print("Right editor has theme: ", right_editor.theme != null)
-	print("COLORS.code_text: ", COLORS.code_text)
-	print("========================")
-
-# Call this debug function in your _ready() to see what's happening
-# Add this line at the end of _ready():
-# call_deferred("_debug_editor_colors")
 
 
 func _handle_shift_enter() -> void:
@@ -2830,18 +2649,3 @@ func _cleanup_resources():
 	is_processing_ai = false
 	is_streaming_response = false
 	current_streaming_text = ""
-
-
-
-func _test_syntax_highlighting():
-	print("Testing syntax highlighting...")
-	print("Left editor font color: ", left_editor.get_theme_color("font_color"))
-	print("Right editor font color: ", right_editor.get_theme_color("font_color"))
-	
-	# If the above prints show white (1,1,1,1), then apply syntax highlighting
-	if left_editor.get_theme_color("font_color") == Color.WHITE:
-		print("Font color is correct, applying syntax highlighting...")
-		_apply_basic_syntax_highlighting(left_editor)
-		_apply_basic_syntax_highlighting(right_editor)
-	else:
-		print("Font color is wrong! It's: ", left_editor.get_theme_color("font_color"))

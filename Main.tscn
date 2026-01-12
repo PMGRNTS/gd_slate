@@ -1,6 +1,6 @@
 [gd_scene load_steps=2 format=3 uid="uid://dg8sqfiusgg86"]
 
-[ext_resource type="Script" path="res://main.gd" id="1_7vk8j"]
+[ext_resource type="Script" uid="uid://dfspg0406ybnu" path="res://main.gd" id="1_7vk8j"]
 
 [node name="Control" type="Control"]
 texture_filter = 1
